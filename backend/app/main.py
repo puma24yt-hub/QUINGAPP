@@ -136,6 +136,57 @@ def _generate_pickup_code() -> str:
     return f"QNG-{code}"
 
 
+def _order_to_dict(o: Order):
+    return {
+        "id": o.id,
+        "status": o.status,
+        "customer_name": o.customer_name,
+        "customer_phone": o.customer_phone,
+        "total_mxn": o.total_mxn,
+        "created_at": _dt(o.created_at),
+        "paid_at": _dt(o.paid_at),
+        "expires_at": _dt(o.expires_at),
+        "delivered_at": _dt(o.delivered_at),
+        "pickup_status": o.pickup_status,
+        "pickup_code": o.pickup_code,
+        "pickup_token": o.pickup_token,
+        "items": [
+            {"id": it.id, "name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
+            for it in (o.items or [])
+        ],
+        "payments": [
+            {
+                "id": p.id,
+                "stripe_session_id": p.stripe_session_id,
+                "payment_status": p.payment_status,
+                "amount_total_cents": p.amount_total_cents,
+                "currency": p.currency,
+                "created_at": _dt(p.created_at),
+            }
+            for p in (o.payments or [])
+        ],
+    }
+
+
+def _maybe_mark_expired(db, o: Order) -> bool:
+    """
+    Returns True if it was expired now.
+    """
+    if o.status in ("DELIVERED", "CANCELLED", "EXPIRED"):
+        return False
+
+    if o.pickup_status == "DELIVERED":
+        return False
+
+    if o.expires_at and _now_utc() > o.expires_at:
+        o.status = "EXPIRED"
+        o.pickup_status = "EXPIRED"
+        db.add(o)
+        return True
+
+    return False
+
+
 @app.get("/")
 def root():
     return {"message": "QUINGAPP backend is running"}
@@ -158,35 +209,7 @@ def admin_list_orders(request: Request, limit: int = 20):
 
         out = []
         for o in orders:
-            out.append({
-                "id": o.id,
-                "status": o.status,
-                "customer_name": o.customer_name,
-                "customer_phone": o.customer_phone,
-                "total_mxn": o.total_mxn,
-                "created_at": _dt(o.created_at),
-                "paid_at": _dt(o.paid_at),
-                "expires_at": _dt(o.expires_at),
-                "delivered_at": _dt(o.delivered_at),
-                "pickup_status": o.pickup_status,
-                "pickup_code": o.pickup_code,
-                "pickup_token": o.pickup_token,
-                "items": [
-                    {"id": it.id, "name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
-                    for it in (o.items or [])
-                ],
-                "payments": [
-                    {
-                        "id": p.id,
-                        "stripe_session_id": p.stripe_session_id,
-                        "payment_status": p.payment_status,
-                        "amount_total_cents": p.amount_total_cents,
-                        "currency": p.currency,
-                        "created_at": _dt(p.created_at),
-                    }
-                    for p in (o.payments or [])
-                ]
-            })
+            out.append(_order_to_dict(o))
 
         return {"ok": True, "count": len(out), "orders": out}
     finally:
@@ -205,37 +228,122 @@ def admin_get_order(order_id: int, request: Request):
         if not o:
             raise HTTPException(status_code=404, detail="Order not found")
 
+        return {"ok": True, "order": _order_to_dict(o)}
+    finally:
+        db.close()
+
+
+# -------------------------
+# Pickup (VERIFY / CONFIRM)  ✅ NUEVO
+# -------------------------
+@app.post("/pickup/verify")
+def pickup_verify(payload: dict, request: Request):
+    """
+    Verify a pickup code or token and return the order info.
+    Requires ADMIN_TOKEN (x-admin-token header OR ?token=...).
+    Payload:
+      {"code":"QNG-XXXXX"}  OR  {"token":"uuid"}
+    """
+    _require_admin(request)
+
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    code = str(payload.get("code", "")).strip()
+    token = str(payload.get("token", "")).strip()
+
+    if not code and not token:
+        raise HTTPException(status_code=400, detail="code or token is required")
+
+    db = SessionLocal()
+    try:
+        q = db.query(Order)
+        if token:
+            o = q.filter(Order.pickup_token == token).first()
+        else:
+            o = q.filter(Order.pickup_code == code).first()
+
+        if not o:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # Expire if needed
+        changed = _maybe_mark_expired(db, o)
+        if changed:
+            db.commit()
+            db.refresh(o)
+
+        # Only allow pickup if PAID + ACTIVE
+        if o.status != "PAID" or o.pickup_status != "ACTIVE":
+            return {
+                "ok": False,
+                "message": "Not eligible for pickup",
+                "order": _order_to_dict(o),
+            }
+
         return {
             "ok": True,
-            "order": {
-                "id": o.id,
-                "status": o.status,
-                "customer_name": o.customer_name,
-                "customer_phone": o.customer_phone,
-                "total_mxn": o.total_mxn,
-                "created_at": _dt(o.created_at),
-                "paid_at": _dt(o.paid_at),
-                "expires_at": _dt(o.expires_at),
-                "delivered_at": _dt(o.delivered_at),
-                "pickup_status": o.pickup_status,
-                "pickup_code": o.pickup_code,
-                "pickup_token": o.pickup_token,
-                "items": [
-                    {"id": it.id, "name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
-                    for it in (o.items or [])
-                ],
-                "payments": [
-                    {
-                        "id": p.id,
-                        "stripe_session_id": p.stripe_session_id,
-                        "payment_status": p.payment_status,
-                        "amount_total_cents": p.amount_total_cents,
-                        "currency": p.currency,
-                        "created_at": _dt(p.created_at),
-                    }
-                    for p in (o.payments or [])
-                ]
+            "message": "Eligible for pickup",
+            "order": _order_to_dict(o),
+        }
+    finally:
+        db.close()
+
+
+@app.post("/pickup/confirm")
+def pickup_confirm(payload: dict, request: Request):
+    """
+    Confirm delivery (mark as DELIVERED).
+    Requires ADMIN_TOKEN.
+    Payload:
+      {"code":"QNG-XXXXX"} OR {"token":"uuid"}
+    """
+    _require_admin(request)
+
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    code = str(payload.get("code", "")).strip()
+    token = str(payload.get("token", "")).strip()
+
+    if not code and not token:
+        raise HTTPException(status_code=400, detail="code or token is required")
+
+    db = SessionLocal()
+    try:
+        q = db.query(Order)
+        if token:
+            o = q.filter(Order.pickup_token == token).first()
+        else:
+            o = q.filter(Order.pickup_code == code).first()
+
+        if not o:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # Expire if needed
+        changed = _maybe_mark_expired(db, o)
+        if changed:
+            db.commit()
+            db.refresh(o)
+
+        if o.status != "PAID" or o.pickup_status != "ACTIVE":
+            return {
+                "ok": False,
+                "message": "Cannot confirm. Not ACTIVE/PAID.",
+                "order": _order_to_dict(o),
             }
+
+        o.status = "DELIVERED"
+        o.pickup_status = "DELIVERED"
+        o.delivered_at = _now_utc()
+
+        db.add(o)
+        db.commit()
+        db.refresh(o)
+
+        return {
+            "ok": True,
+            "message": "Delivered confirmed",
+            "order": _order_to_dict(o),
         }
     finally:
         db.close()
