@@ -3,6 +3,7 @@ import logging
 import stripe
 import uuid
 import secrets
+import os
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import (
@@ -25,6 +26,25 @@ if not logger.handlers:
 
 # Stripe
 stripe.api_key = STRIPE_SECRET_KEY
+
+# -------------------------
+# Admin token (TEMP)
+# -------------------------
+# Set this in Render ENV as ADMIN_TOKEN=<any strong string>
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+
+def _require_admin(request: Request):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN not configured")
+    token = (request.headers.get("x-admin-token") or request.query_params.get("token") or "").strip()
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _dt(v):
+    return v.isoformat() if v else None
+
 
 # -------------------------
 # Database
@@ -119,6 +139,106 @@ def _generate_pickup_code() -> str:
 @app.get("/")
 def root():
     return {"message": "QUINGAPP backend is running"}
+
+
+# -------------------------
+# Admin (VIEW ORDERS) - TEMP
+# -------------------------
+@app.get("/admin/orders")
+def admin_list_orders(request: Request, limit: int = 20):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    limit = max(1, min(int(limit or 20), 200))
+
+    db = SessionLocal()
+    try:
+        orders = db.query(Order).order_by(Order.id.desc()).limit(limit).all()
+
+        out = []
+        for o in orders:
+            out.append({
+                "id": o.id,
+                "status": o.status,
+                "customer_name": o.customer_name,
+                "customer_phone": o.customer_phone,
+                "total_mxn": o.total_mxn,
+                "created_at": _dt(o.created_at),
+                "paid_at": _dt(o.paid_at),
+                "expires_at": _dt(o.expires_at),
+                "delivered_at": _dt(o.delivered_at),
+                "pickup_status": o.pickup_status,
+                "pickup_code": o.pickup_code,
+                "pickup_token": o.pickup_token,
+                "items": [
+                    {"id": it.id, "name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
+                    for it in (o.items or [])
+                ],
+                "payments": [
+                    {
+                        "id": p.id,
+                        "stripe_session_id": p.stripe_session_id,
+                        "payment_status": p.payment_status,
+                        "amount_total_cents": p.amount_total_cents,
+                        "currency": p.currency,
+                        "created_at": _dt(p.created_at),
+                    }
+                    for p in (o.payments or [])
+                ]
+            })
+
+        return {"ok": True, "count": len(out), "orders": out}
+    finally:
+        db.close()
+
+
+@app.get("/admin/orders/{order_id}")
+def admin_get_order(order_id: int, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    db = SessionLocal()
+    try:
+        o = db.query(Order).filter(Order.id == int(order_id)).first()
+        if not o:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        return {
+            "ok": True,
+            "order": {
+                "id": o.id,
+                "status": o.status,
+                "customer_name": o.customer_name,
+                "customer_phone": o.customer_phone,
+                "total_mxn": o.total_mxn,
+                "created_at": _dt(o.created_at),
+                "paid_at": _dt(o.paid_at),
+                "expires_at": _dt(o.expires_at),
+                "delivered_at": _dt(o.delivered_at),
+                "pickup_status": o.pickup_status,
+                "pickup_code": o.pickup_code,
+                "pickup_token": o.pickup_token,
+                "items": [
+                    {"id": it.id, "name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
+                    for it in (o.items or [])
+                ],
+                "payments": [
+                    {
+                        "id": p.id,
+                        "stripe_session_id": p.stripe_session_id,
+                        "payment_status": p.payment_status,
+                        "amount_total_cents": p.amount_total_cents,
+                        "currency": p.currency,
+                        "created_at": _dt(p.created_at),
+                    }
+                    for p in (o.payments or [])
+                ]
+            }
+        }
+    finally:
+        db.close()
 
 
 # -------------------------
@@ -302,7 +422,7 @@ async def stripe_webhook(request: Request):
                     db.add(
                         Payment(
                             order_id=order.id,
-                            stripe_session_id=stripe_session_id or "",
+                            stripe_session_id=str(stripe_session_id or ""),
                             payment_status=str(payment_status or ""),
                             amount_total_cents=int(amount_total or 0),
                             currency=str(currency or ""),
