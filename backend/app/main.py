@@ -5,9 +5,10 @@ import uuid
 import secrets
 import os
 from datetime import datetime, timezone, timedelta
+import re
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, Text, ForeignKey
+    create_engine, Column, Integer, String, DateTime, ForeignKey, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -51,6 +52,7 @@ def _dt(v):
 # -------------------------
 Base = declarative_base()
 
+
 class Order(Base):
     __tablename__ = "orders"
 
@@ -59,6 +61,8 @@ class Order(Base):
 
     customer_name = Column(String(200), nullable=False, default="")
     customer_phone = Column(String(50), nullable=False, default="")
+    # ✅ NEW: email to send sales note (nota de venta)
+    customer_email = Column(String(254), nullable=False, default="")
 
     total_mxn = Column(Integer, nullable=False, default=0)  # stored in MXN pesos (int)
 
@@ -71,6 +75,11 @@ class Order(Base):
     pickup_status = Column(String(32), nullable=True)               # ACTIVE | DELIVERED | EXPIRED
     pickup_code = Column(String(32), nullable=True)                 # visible code
     pickup_token = Column(String(64), nullable=True)                # uuid/token for QR payload
+
+    # ✅ NEW: status for note sending
+    note_sent_at = Column(DateTime(timezone=True), nullable=True)
+    note_status = Column(String(32), nullable=True)                 # SENT | FAILED | SKIPPED
+    note_error = Column(String(500), nullable=True)
 
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
     payments = relationship("Payment", back_populates="order", cascade="all, delete-orphan")
@@ -109,11 +118,31 @@ def _normalize_db_url(url: str) -> str:
     # Render gives postgresql://... which works with psycopg2 in SQLAlchemy
     return (url or "").strip()
 
+
 if not DATABASE_URL:
     logger.warning("DATABASE_URL is empty. DB features will fail until configured in Render.")
 
 _engine = create_engine(_normalize_db_url(DATABASE_URL), pool_pre_ping=True) if DATABASE_URL else None
 SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False) if _engine else None
+
+
+def _ensure_orders_columns():
+    """
+    SQLAlchemy create_all will NOT add new columns to an existing table.
+    This helper applies safe ALTER TABLE for the new columns, if missing (Postgres).
+    """
+    if not _engine:
+        return
+    try:
+        with _engine.begin() as conn:
+            # customer_email
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_email VARCHAR(254) NOT NULL DEFAULT ''"))
+            # note fields
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS note_sent_at TIMESTAMPTZ NULL"))
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS note_status VARCHAR(32) NULL"))
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS note_error VARCHAR(500) NULL"))
+    except Exception:
+        logger.exception("Could not ensure new columns on orders table (ALTER TABLE).")
 
 
 @app.on_event("startup")
@@ -122,7 +151,8 @@ def _startup_create_tables():
         logger.warning("Startup: DB not configured, skipping create_all.")
         return
     Base.metadata.create_all(bind=_engine)
-    logger.info("DB tables ensured (create_all).")
+    _ensure_orders_columns()
+    logger.info("DB tables ensured (create_all + alter-if-needed).")
 
 
 def _now_utc():
@@ -142,12 +172,21 @@ def _pickup_qr_payload(pickup_token: str) -> str:
     return f"quingapp://pickup?token={pickup_token}"
 
 
+def _is_valid_email(email: str) -> bool:
+    email = (email or "").strip()
+    if not email or len(email) > 254:
+        return False
+    # Simple validation (good enough for MVP)
+    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email) is not None
+
+
 def _order_to_dict(o: Order):
     return {
         "id": o.id,
         "status": o.status,
         "customer_name": o.customer_name,
         "customer_phone": o.customer_phone,
+        "customer_email": o.customer_email,
         "total_mxn": o.total_mxn,
         "created_at": _dt(o.created_at),
         "paid_at": _dt(o.paid_at),
@@ -156,6 +195,9 @@ def _order_to_dict(o: Order):
         "pickup_status": o.pickup_status,
         "pickup_code": o.pickup_code,
         "pickup_token": o.pickup_token,
+        "note_sent_at": _dt(o.note_sent_at),
+        "note_status": o.note_status,
+        "note_error": o.note_error,
         "items": [
             {"id": it.id, "name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
             for it in (o.items or [])
@@ -180,6 +222,7 @@ def _order_public_to_dict(o: Order):
         "id": o.id,
         "status": o.status,
         "customer_name": o.customer_name,
+        "customer_email": o.customer_email,
         "total_mxn": o.total_mxn,
         "created_at": _dt(o.created_at),
         "paid_at": _dt(o.paid_at),
@@ -188,6 +231,8 @@ def _order_public_to_dict(o: Order):
         "pickup_status": o.pickup_status,
         "pickup_code": o.pickup_code,
         "pickup_token": o.pickup_token,
+        "note_sent_at": _dt(o.note_sent_at),
+        "note_status": o.note_status,
         "items": [
             {"name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
             for it in (o.items or [])
@@ -326,7 +371,7 @@ def pickup_confirm(payload: dict, request: Request):
 
 
 # -------------------------
-# Pickup (QR payload + Redeem alias) ✅ NUEVO
+# Pickup (QR payload + Redeem alias)
 # -------------------------
 @app.get("/pickup/qr_payload/{pickup_token}")
 def pickup_qr_payload(pickup_token: str):
@@ -364,6 +409,68 @@ def pickup_redeem(payload: dict, request: Request):
 
 
 # -------------------------
+# Nota de venta (email) — MVP
+# -------------------------
+def _mark_note_status(db, order: Order, status: str, err: str = ""):
+    order.note_sent_at = _now_utc()
+    order.note_status = status
+    order.note_error = (err or "")[:500]
+    db.add(order)
+
+
+def _send_note_email_if_configured(order: Order):
+    """Returns (ok: bool, err: str). Sends only if SMTP is configured."""
+    host = os.getenv("SMTP_HOST", "").strip()
+    port = int(os.getenv("SMTP_PORT", "0") or "0")
+    user = os.getenv("SMTP_USER", "").strip()
+    pwd = os.getenv("SMTP_PASS", "").strip()
+    from_email = os.getenv("SMTP_FROM", "").strip()
+
+    if not host or not port or not from_email:
+        return False, "SMTP not configured"
+
+    try:
+        import smtplib
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        msg["Subject"] = f"Nota de venta QUING — Pedido #{order.id}"
+        msg["From"] = from_email
+        msg["To"] = order.customer_email
+
+        lines = [
+            "Gracias por tu compra en QUING.",
+            f"Pedido: #{order.id}",
+            f"Nombre: {order.customer_name}",
+            f"Total: ${order.total_mxn} MXN",
+            "",
+            "Detalle:",
+        ]
+        for it in (order.items or []):
+            lines.append(f"- {it.qty} x {it.name} (${it.unit_amount_mxn} MXN c/u)")
+        lines += [
+            "",
+            "Recoge en tienda mostrando tu código/QR.",
+        ]
+        msg.set_content("\n".join(lines))
+
+        with smtplib.SMTP(host, port, timeout=20) as s:
+            s.ehlo()
+            try:
+                s.starttls()
+                s.ehlo()
+            except Exception:
+                pass
+            if user and pwd:
+                s.login(user, pwd)
+            s.send_message(msg)
+
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+# -------------------------
 # Checkout (Card + OXXO)
 # -------------------------
 @app.post("/checkout")
@@ -380,9 +487,12 @@ async def create_checkout(payload: dict):
 
     customer_name = str(payload.get("customer_name", "")).strip()
     customer_phone = str(payload.get("customer_phone", "")).strip()
+    customer_email = str(payload.get("customer_email", "")).strip()
 
     if not customer_name:
         raise HTTPException(status_code=400, detail="customer_name is required")
+    if not customer_email or not _is_valid_email(customer_email):
+        raise HTTPException(status_code=400, detail="customer_email is required (valid email)")
 
     total_mxn = 0
     cleaned_items = []
@@ -419,6 +529,7 @@ async def create_checkout(payload: dict):
             status="PENDING_PAYMENT",
             customer_name=customer_name,
             customer_phone=customer_phone,
+            customer_email=customer_email,
             total_mxn=total_mxn,
             created_at=_now_utc(),
         )
@@ -458,6 +569,7 @@ async def create_checkout(payload: dict):
                 "order_id": str(order.id),
                 "customer_name": customer_name,
                 "customer_phone": customer_phone,
+                "customer_email": customer_email,
                 "app": "QUINGAPP",
             },
         )
@@ -547,6 +659,18 @@ async def stripe_webhook(request: Request):
                     )
 
                     db.commit()
+                    db.refresh(order)
+
+                    # ✅ After PAID: attempt to send note by email (if SMTP configured)
+                    if order.customer_email:
+                        ok, err = _send_note_email_if_configured(order)
+                        if ok:
+                            _mark_note_status(db, order, "SENT", "")
+                        else:
+                            status = "SKIPPED" if "not configured" in (err or "").lower() else "FAILED"
+                            _mark_note_status(db, order, status, err)
+                        db.commit()
+
             except Exception:
                 db.rollback()
                 logger.exception("DB update on webhook failed")
