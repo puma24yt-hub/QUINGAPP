@@ -491,7 +491,9 @@ async def create_checkout(payload: dict):
 
     if not customer_name:
         raise HTTPException(status_code=400, detail="customer_name is required")
-    if not customer_email or not _is_valid_email(customer_email):
+    # customer_email is OPTIONAL (if provided, must be valid)
+    if customer_email and not _is_valid_email(customer_email):
+        raise HTTPException(status_code=400, detail="customer_email invalid")
         raise HTTPException(status_code=400, detail="customer_email is required (valid email)")
 
     total_mxn = 0
@@ -501,7 +503,8 @@ async def create_checkout(payload: dict):
     for it in items:
         name = str(it.get("name", "")).strip()
         qty = int(it.get("qty", 0) or 0)
-        unit_amount_mxn = float(it.get("unit_amount_mxn", 0) or 0)
+        # Accept both unit_amount_mxn (preferred) and unit_price_mxn (legacy)
+        unit_amount_mxn = float(it.get("unit_amount_mxn", it.get("unit_price_mxn", 0)) or 0)
 
         if not name or qty <= 0 or unit_amount_mxn <= 0:
             raise HTTPException(status_code=400, detail="Invalid item in items")
@@ -559,7 +562,7 @@ async def create_checkout(payload: dict):
     cancel_url = "https://quingapp-backend.onrender.com/checkout/cancel"
 
     try:
-        session = stripe.checkout.Session.create(
+        session_kwargs = dict(
             mode="payment",
             payment_method_types=["card", "oxxo"],
             line_items=line_items,
@@ -573,6 +576,10 @@ async def create_checkout(payload: dict):
                 "app": "QUINGAPP",
             },
         )
+        if customer_email:
+            session_kwargs["customer_email"] = customer_email
+
+        session = stripe.checkout.Session.create(**session_kwargs)
     except Exception as e:
         logger.exception("Stripe Checkout create failed")
         raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
