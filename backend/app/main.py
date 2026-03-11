@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
 import logging
 import stripe
 import uuid
@@ -254,6 +255,96 @@ def _maybe_mark_expired(db, o: Order) -> bool:
     return False
 
 
+def _get_or_create_payment_record(db, order_id: int, stripe_session_id: str):
+    payment = (
+        db.query(Payment)
+        .filter(Payment.order_id == order_id, Payment.stripe_session_id == str(stripe_session_id or ""))
+        .first()
+    )
+    if not payment:
+        payment = Payment(
+            order_id=order_id,
+            stripe_session_id=str(stripe_session_id or ""),
+            created_at=_now_utc(),
+        )
+        db.add(payment)
+    return payment
+
+
+def _record_payment_snapshot(db, order: Order, stripe_session_id: str, payment_status: str, amount_total, currency: str):
+    payment = _get_or_create_payment_record(db, order.id, stripe_session_id)
+    payment.payment_status = str(payment_status or "")
+    payment.amount_total_cents = int(amount_total or 0)
+    payment.currency = str(currency or "")
+    db.add(payment)
+
+
+def _send_note_once(db, order: Order):
+    # Avoid sending twice if webhook is retried.
+    if order.note_status == "SENT":
+        return
+
+    if order.customer_email:
+        ok, err = _send_note_email_if_configured(order)
+        if ok:
+            _mark_note_status(db, order, "SENT", "")
+        else:
+            status = "SKIPPED" if "not configured" in (err or "").lower() else "FAILED"
+            _mark_note_status(db, order, status, err)
+    else:
+        _mark_note_status(db, order, "SKIPPED", "customer_email empty")
+
+
+def _mark_order_paid(db, order: Order, stripe_session_id: str, payment_status: str, amount_total, currency: str):
+    # Always keep a payment snapshot.
+    _record_payment_snapshot(db, order, stripe_session_id, payment_status, amount_total, currency)
+
+    # Idempotent: if already paid/delivered, do not regenerate code or token.
+    if (order.status or "").upper() not in ("PAID", "DELIVERED"):
+        paid_at = _now_utc()
+        order.status = "PAID"
+        order.paid_at = paid_at
+        order.expires_at = paid_at + timedelta(days=30)
+        order.pickup_status = "ACTIVE"
+
+    if not order.pickup_code:
+        order.pickup_code = _generate_pickup_code()
+    if not order.pickup_token:
+        order.pickup_token = str(uuid.uuid4())
+
+    db.add(order)
+    _send_note_once(db, order)
+
+
+def _mark_order_payment_pending(db, order: Order, stripe_session_id: str, payment_status: str, amount_total, currency: str):
+    _record_payment_snapshot(db, order, stripe_session_id, payment_status, amount_total, currency)
+    if (order.status or "").upper() == "PENDING_PAYMENT":
+        # Keep it pending and make sure no pickup is activated early.
+        if not order.paid_at:
+            order.pickup_status = None
+            order.pickup_code = None
+            order.pickup_token = None
+    db.add(order)
+
+
+def _mark_order_payment_failed(db, order: Order, stripe_session_id: str, payment_status: str, amount_total, currency: str):
+    _record_payment_snapshot(db, order, stripe_session_id, payment_status, amount_total, currency)
+    if (order.status or "").upper() not in ("PAID", "DELIVERED"):
+        order.status = "CANCELLED"
+        order.pickup_status = None
+        order.pickup_code = None
+        order.pickup_token = None
+    db.add(order)
+
+
+def _extract_order_id_from_session(session) -> int:
+    meta = session.get("metadata") or {}
+    order_id_raw = str(meta.get("order_id") or "").strip()
+    if not order_id_raw.isdigit():
+        raise HTTPException(status_code=400, detail="order_id missing in Stripe session metadata")
+    return int(order_id_raw)
+
+
 @app.get("/")
 def root():
     return {"message": "QUINGAPP backend is running"}
@@ -491,10 +582,10 @@ async def create_checkout(payload: dict):
 
     if not customer_name:
         raise HTTPException(status_code=400, detail="customer_name is required")
+
     # customer_email is OPTIONAL (if provided, must be valid)
     if customer_email and not _is_valid_email(customer_email):
         raise HTTPException(status_code=400, detail="customer_email invalid")
-        raise HTTPException(status_code=400, detail="customer_email is required (valid email)")
 
     total_mxn = 0
     cleaned_items = []
@@ -589,16 +680,116 @@ async def create_checkout(payload: dict):
 
 @app.get("/checkout/success")
 def checkout_success(session_id: str = ""):
-    return {
-        "ok": True,
-        "message": "Pago completado. (placeholder) Luego aquí mostraremos el QR/código en la app.",
-        "session_id": session_id,
-    }
+    """
+    Stripe redirects here after checkout.
+
+    Important:
+    - For card or instant-paid methods: mark PAID if needed and deep-link to app.
+    - For delayed methods like OXXO: DO NOT mark PAID here unless Stripe says payment_status=paid.
+    """
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe secret not configured")
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid session_id: {e}")
+
+    payment_status = (session.get("payment_status") or "").lower()
+    meta = session.get("metadata") or {}
+    order_id_raw = str(meta.get("order_id") or "").strip()
+
+    if not order_id_raw.isdigit():
+        raise HTTPException(status_code=400, detail="order_id missing in Stripe session metadata")
+
+    order_id = int(order_id_raw)
+
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        if payment_status == "paid":
+            _mark_order_paid(
+                db=db,
+                order=order,
+                stripe_session_id=session.get("id") or "",
+                payment_status=payment_status,
+                amount_total=session.get("amount_total"),
+                currency=session.get("currency"),
+            )
+            db.commit()
+            db.refresh(order)
+
+            pickup_token = order.pickup_token
+            pickup_code = order.pickup_code
+            deeplink = f"quingapp://pickup?token={pickup_token}"
+
+            html = f"""
+            <html>
+              <head>
+                <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <title>QUING - Pago confirmado</title>
+              </head>
+              <body style="font-family: Arial, sans-serif; padding: 24px;">
+                <h2>✅ Pago confirmado</h2>
+                <p>Ahora regresaremos a la app para mostrar tu código de recogida.</p>
+                <p><b>Código de recogida:</b> {pickup_code}</p>
+                <p style="margin-top:20px;">
+                  <a href="{deeplink}" style="display:inline-block; background:#1f5cff; color:white; padding:14px 18px; border-radius:10px; text-decoration:none; font-weight:700;">
+                    Abrir QUING App
+                  </a>
+                </p>
+                <p style="margin-top:14px; color:#666;">Si no se abre automáticamente, toca el botón.</p>
+
+                <script>
+                  setTimeout(function() {{
+                    window.location.href = "{deeplink}";
+                  }}, 300);
+                </script>
+              </body>
+            </html>
+            """
+            return HTMLResponse(content=html, status_code=200)
+
+        # Delayed methods (like OXXO): show pending page and DO NOT activate pickup yet.
+        html = f"""
+        <html>
+          <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <title>QUING - Pago pendiente</title>
+          </head>
+          <body style="font-family: Arial, sans-serif; padding: 24px;">
+            <h2>⏳ Pago pendiente de confirmación</h2>
+            <p>Tu pedido fue creado, pero Stripe todavía no confirma el pago.</p>
+            <p>Esto puede pasar con métodos diferidos como OXXO.</p>
+            <p><b>Pedido:</b> #{order.id}</p>
+            <p><b>Session:</b> {session_id}</p>
+            <p style="margin-top:20px; color:#666;">Cuando Stripe confirme el pago, tu pedido se activará automáticamente y ya podrás ver tu código/QR de recogida en la app.</p>
+          </body>
+        </html>
+        """
+        return HTMLResponse(content=html, status_code=200)
+    finally:
+        db.close()
 
 
 @app.get("/checkout/cancel")
 def checkout_cancel():
-    return {"ok": False, "message": "Pago cancelado. (placeholder)"}
+    html = """
+    <html>
+      <head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
+      <body style="font-family:Arial; padding:24px;">
+        <h2>Pago cancelado</h2>
+        <p>No se realizó el cargo. Puedes volver a intentarlo desde la app.</p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=html, status_code=200)
 
 
 # -------------------------
@@ -623,20 +814,24 @@ async def stripe_webhook(request: Request):
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
+    event_type = event.get("type") or ""
+    session = (event.get("data") or {}).get("object") or {}
 
+    if event_type in (
+        "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+        "checkout.session.async_payment_failed",
+    ):
         stripe_session_id = session.get("id")
         payment_status = session.get("payment_status")
         amount_total = session.get("amount_total")
         currency = session.get("currency")
-
         meta = session.get("metadata") or {}
-        order_id_raw = (meta.get("order_id") or "").strip()
+        order_id_raw = str(meta.get("order_id") or "").strip()
 
         logger.info(
-            "checkout.session.completed | order_id=%s | session=%s | payment_status=%s | amount_total=%s %s",
-            order_id_raw, stripe_session_id, payment_status, amount_total, currency
+            "%s | order_id=%s | session=%s | payment_status=%s | amount_total=%s %s",
+            event_type, order_id_raw, stripe_session_id, payment_status, amount_total, currency
         )
 
         if SessionLocal and order_id_raw.isdigit():
@@ -644,40 +839,50 @@ async def stripe_webhook(request: Request):
             db = SessionLocal()
             try:
                 order = db.query(Order).filter(Order.id == order_id).first()
-                if order and order.status != "PAID":
-                    paid_at = _now_utc()
-                    order.status = "PAID"
-                    order.paid_at = paid_at
-                    order.expires_at = paid_at + timedelta(days=30)
+                if order:
+                    if event_type == "checkout.session.completed":
+                        # For delayed methods like OXXO this only means the customer completed Checkout,
+                        # not necessarily that funds are already available.
+                        if str(payment_status or "").lower() == "paid":
+                            _mark_order_paid(
+                                db=db,
+                                order=order,
+                                stripe_session_id=stripe_session_id or "",
+                                payment_status=payment_status,
+                                amount_total=amount_total,
+                                currency=currency,
+                            )
+                        else:
+                            _mark_order_payment_pending(
+                                db=db,
+                                order=order,
+                                stripe_session_id=stripe_session_id or "",
+                                payment_status=payment_status,
+                                amount_total=amount_total,
+                                currency=currency,
+                            )
 
-                    order.pickup_status = "ACTIVE"
-                    order.pickup_code = _generate_pickup_code()
-                    order.pickup_token = str(uuid.uuid4())
-
-                    db.add(
-                        Payment(
-                            order_id=order.id,
-                            stripe_session_id=str(stripe_session_id or ""),
-                            payment_status=str(payment_status or ""),
-                            amount_total_cents=int(amount_total or 0),
-                            currency=str(currency or ""),
-                            created_at=_now_utc(),
+                    elif event_type == "checkout.session.async_payment_succeeded":
+                        _mark_order_paid(
+                            db=db,
+                            order=order,
+                            stripe_session_id=stripe_session_id or "",
+                            payment_status=payment_status,
+                            amount_total=amount_total,
+                            currency=currency,
                         )
-                    )
+
+                    elif event_type == "checkout.session.async_payment_failed":
+                        _mark_order_payment_failed(
+                            db=db,
+                            order=order,
+                            stripe_session_id=stripe_session_id or "",
+                            payment_status=payment_status,
+                            amount_total=amount_total,
+                            currency=currency,
+                        )
 
                     db.commit()
-                    db.refresh(order)
-
-                    # ✅ After PAID: attempt to send note by email (if SMTP configured)
-                    if order.customer_email:
-                        ok, err = _send_note_email_if_configured(order)
-                        if ok:
-                            _mark_note_status(db, order, "SENT", "")
-                        else:
-                            status = "SKIPPED" if "not configured" in (err or "").lower() else "FAILED"
-                            _mark_note_status(db, order, status, err)
-                        db.commit()
-
             except Exception:
                 db.rollback()
                 logger.exception("DB update on webhook failed")
