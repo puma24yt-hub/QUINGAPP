@@ -28,6 +28,8 @@ if not logger.handlers:
 
 # Stripe
 stripe.api_key = STRIPE_SECRET_KEY
+STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "").strip()
+STRIPE_EPHEMERAL_KEY_API_VERSION = os.getenv("STRIPE_EPHEMERAL_KEY_API_VERSION", "2024-06-20").strip()
 
 # -------------------------
 # Admin token (TEMP)
@@ -267,7 +269,7 @@ def _record_payment_snapshot(db, order: Order, stripe_session_id: str):
         if not order.paid_at:
             order.paid_at = _now_utc()
         if not order.expires_at:
-            order.expires_at = order.paid_at + timedelta(days=30)
+            order.expires_at = order.paid_at + timedelta(days=60)
         if order.pickup_status != "DELIVERED":
             order.pickup_status = "ACTIVE"
 
@@ -316,6 +318,132 @@ def _ensure_unique_pickup_fields(db):
         )
         if not exists:
             return code, token
+
+
+
+def _validate_checkout_payload(payload: dict):
+    items = payload.get("items") or []
+    if not isinstance(items, list) or len(items) == 0:
+        raise HTTPException(status_code=400, detail="items is required")
+
+    customer_name = str(payload.get("customer_name", "")).strip()
+    customer_phone = str(payload.get("customer_phone", "")).strip()
+    customer_email = str(payload.get("customer_email", "")).strip()
+
+    if not customer_name:
+        raise HTTPException(status_code=400, detail="customer_name is required")
+
+    if customer_email and not _is_valid_email(customer_email):
+        raise HTTPException(status_code=400, detail="customer_email invalid")
+
+    total_mxn = 0
+    cleaned_items = []
+    line_items = []
+
+    for it in items:
+        name = str(it.get("name", "")).strip()
+        qty = int(it.get("qty", 0) or 0)
+        unit_amount_mxn = float(it.get("unit_amount_mxn", it.get("unit_price_mxn", 0)) or 0)
+
+        if not name or qty <= 0 or unit_amount_mxn <= 0:
+            raise HTTPException(status_code=400, detail="Invalid item in items")
+
+        unit_amount_pesos = int(round(unit_amount_mxn))
+        total_mxn += unit_amount_pesos * qty
+
+        cleaned_items.append({"name": name, "qty": qty, "unit_amount_mxn": unit_amount_pesos})
+
+        line_items.append({
+            "price_data": {
+                "currency": "mxn",
+                "product_data": {"name": name},
+                "unit_amount": unit_amount_pesos * 100,
+            },
+            "quantity": qty,
+        })
+
+    return {
+        "customer_name": customer_name,
+        "customer_phone": customer_phone,
+        "customer_email": customer_email,
+        "total_mxn": total_mxn,
+        "cleaned_items": cleaned_items,
+        "line_items": line_items,
+    }
+
+
+def _create_pending_order(db, checkout_data: dict):
+    pickup_code, pickup_token = _ensure_unique_pickup_fields(db)
+
+    order = Order(
+        status="PENDING_PAYMENT",
+        customer_name=checkout_data["customer_name"],
+        customer_phone=checkout_data["customer_phone"],
+        customer_email=checkout_data["customer_email"],
+        total_mxn=checkout_data["total_mxn"],
+        created_at=_now_utc(),
+        pickup_status="PENDING",
+        pickup_code=pickup_code,
+        pickup_token=pickup_token,
+        note_status="PENDING" if checkout_data["customer_email"] else "SKIPPED",
+    )
+    db.add(order)
+    db.flush()
+
+    for it in checkout_data["cleaned_items"]:
+        db.add(OrderItem(
+            order_id=order.id,
+            name=it["name"],
+            qty=it["qty"],
+            unit_amount_mxn=it["unit_amount_mxn"],
+        ))
+
+    return order, pickup_code, pickup_token
+
+
+def _mark_order_paid_from_payment_intent(db, payment_intent_id: str):
+    payment = db.query(Payment).filter(Payment.stripe_session_id == str(payment_intent_id or "")).first()
+    if payment:
+        order = db.query(Order).filter(Order.id == payment.order_id).first()
+    else:
+        order = None
+
+    if not order:
+        pi = stripe.PaymentIntent.retrieve(payment_intent_id)
+        order_id = None
+        metadata = getattr(pi, "metadata", None) or {}
+        try:
+            order_id = int(str(metadata.get("order_id", "")).strip() or "0")
+        except Exception:
+            order_id = None
+
+        if not order_id:
+            return None, None
+
+        order = db.query(Order).filter(Order.id == order_id).first()
+        if not order:
+            return None, None
+
+        payment = _get_or_create_payment_record(db, order.id, payment_intent_id)
+
+    pi = stripe.PaymentIntent.retrieve(payment_intent_id)
+    payment.payment_status = getattr(pi, "status", None)
+    payment.amount_total_cents = getattr(pi, "amount", None)
+    payment.currency = getattr(pi, "currency", None)
+
+    if getattr(pi, "status", None) == "succeeded":
+        if order.status != "PAID":
+            order.status = "PAID"
+        if not order.paid_at:
+            order.paid_at = _now_utc()
+        if not order.expires_at:
+            order.expires_at = order.paid_at + timedelta(days=60)
+        if order.pickup_status != "DELIVERED":
+            order.pickup_status = "ACTIVE"
+
+    db.add(order)
+    db.add(payment)
+    return order, payment
 
 
 # -------------------------
@@ -614,74 +742,11 @@ async def create_checkout(payload: dict):
     if not SessionLocal:
         raise HTTPException(status_code=500, detail="Database not configured")
 
-    items = payload.get("items") or []
-    if not isinstance(items, list) or len(items) == 0:
-        raise HTTPException(status_code=400, detail="items is required")
-
-    customer_name = str(payload.get("customer_name", "")).strip()
-    customer_phone = str(payload.get("customer_phone", "")).strip()
-    customer_email = str(payload.get("customer_email", "")).strip()
-
-    if not customer_name:
-        raise HTTPException(status_code=400, detail="customer_name is required")
-
-    # customer_email is OPTIONAL (if provided, must be valid)
-    if customer_email and not _is_valid_email(customer_email):
-        raise HTTPException(status_code=400, detail="customer_email invalid")
-
-    total_mxn = 0
-    cleaned_items = []
-    line_items = []
-
-    for it in items:
-        name = str(it.get("name", "")).strip()
-        qty = int(it.get("qty", 0) or 0)
-        # Accept both unit_amount_mxn (preferred) and unit_price_mxn (legacy)
-        unit_amount_mxn = float(it.get("unit_amount_mxn", it.get("unit_price_mxn", 0)) or 0)
-
-        if not name or qty <= 0 or unit_amount_mxn <= 0:
-            raise HTTPException(status_code=400, detail="Invalid item in items")
-
-        unit_amount_pesos = int(round(unit_amount_mxn))
-        total_mxn += unit_amount_pesos * qty
-
-        cleaned_items.append({"name": name, "qty": qty, "unit_amount_mxn": unit_amount_pesos})
-
-        line_items.append({
-            "price_data": {
-                "currency": "mxn",
-                "product_data": {"name": name},
-                "unit_amount": unit_amount_pesos * 100,  # Stripe wants cents
-            },
-            "quantity": qty,
-        })
+    checkout_data = _validate_checkout_payload(payload)
 
     db = SessionLocal()
     try:
-        pickup_code, pickup_token = _ensure_unique_pickup_fields(db)
-
-        order = Order(
-            status="PENDING_PAYMENT",
-            customer_name=customer_name,
-            customer_phone=customer_phone,
-            customer_email=customer_email,
-            total_mxn=total_mxn,
-            created_at=_now_utc(),
-            pickup_status="PENDING",
-            pickup_code=pickup_code,
-            pickup_token=pickup_token,
-            note_status="PENDING" if customer_email else "SKIPPED",
-        )
-        db.add(order)
-        db.flush()  # get order.id
-
-        for it in cleaned_items:
-            db.add(OrderItem(
-                order_id=order.id,
-                name=it["name"],
-                qty=it["qty"],
-                unit_amount_mxn=it["unit_amount_mxn"],
-            ))
+        order, pickup_code, pickup_token = _create_pending_order(db, checkout_data)
 
         success_url = f"{os.getenv('BASE_URL', '').rstrip('/')}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}"
         cancel_url = f"{os.getenv('BASE_URL', '').rstrip('/')}/checkout/cancel"
@@ -692,7 +757,7 @@ async def create_checkout(payload: dict):
         session = stripe.checkout.Session.create(
             mode="payment",
             payment_method_types=["card"],
-            line_items=line_items,
+            line_items=checkout_data["line_items"],
             success_url=success_url,
             cancel_url=cancel_url,
             metadata={
@@ -725,6 +790,83 @@ async def create_checkout(payload: dict):
     except Exception as e:
         db.rollback()
         logger.exception("create_checkout failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/checkout/mobile")
+async def create_mobile_checkout(payload: dict):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe secret key not configured")
+
+    if not STRIPE_PUBLISHABLE_KEY:
+        raise HTTPException(status_code=500, detail="STRIPE_PUBLISHABLE_KEY not configured")
+
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    checkout_data = _validate_checkout_payload(payload)
+
+    db = SessionLocal()
+    try:
+        order, pickup_code, pickup_token = _create_pending_order(db, checkout_data)
+
+        customer = stripe.Customer.create(
+            name=checkout_data["customer_name"],
+            phone=checkout_data["customer_phone"] or None,
+            email=checkout_data["customer_email"] or None,
+            metadata={
+                "order_id": str(order.id),
+                "pickup_token": pickup_token,
+                "pickup_code": pickup_code,
+            },
+        )
+
+        ephemeral_key = stripe.EphemeralKey.create(
+            customer=customer.id,
+            stripe_version=STRIPE_EPHEMERAL_KEY_API_VERSION,
+        )
+
+        payment_intent = stripe.PaymentIntent.create(
+            amount=checkout_data["total_mxn"] * 100,
+            currency="mxn",
+            customer=customer.id,
+            automatic_payment_methods={"enabled": True},
+            metadata={
+                "order_id": str(order.id),
+                "pickup_token": pickup_token,
+                "pickup_code": pickup_code,
+            },
+        )
+
+        db.add(Payment(
+            order_id=order.id,
+            stripe_session_id=payment_intent.id,
+            created_at=_now_utc(),
+        ))
+
+        db.commit()
+        db.refresh(order)
+
+        return {
+            "ok": True,
+            "mode": "mobile_payment_sheet",
+            "order_id": order.id,
+            "pickup_code": pickup_code,
+            "pickup_token": pickup_token,
+            "customer_id": customer.id,
+            "ephemeral_key": ephemeral_key.secret,
+            "payment_intent": payment_intent.client_secret,
+            "payment_intent_id": payment_intent.id,
+            "publishable_key": STRIPE_PUBLISHABLE_KEY,
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("create_mobile_checkout failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
@@ -778,38 +920,41 @@ def checkout_success(session_id: str = ""):
         <html>
         <head>
           <meta charset="utf-8" />
-          <meta name="viewport" content="width=device-width,initial-scale=1" />
-          <title>Pago confirmado</title>
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+          <title>Abriendo QUING...</title>
           <style>
-            body {{
-              font-family: system-ui, -apple-system, Arial, sans-serif;
-              margin: 24px;
-              color: #111;
+            html, body {{
+              margin: 0;
+              padding: 0;
+              width: 100%;
+              height: 100%;
+              background: #ffffff;
+              overflow: hidden;
             }}
-            .btn {{
-              display: inline-block;
-              padding: 14px 22px;
-              border-radius: 12px;
-              text-decoration: none;
-              background: #1769f3;
-              color: white;
-              font-weight: 700;
-            }}
-            .muted {{ color: #666; }}
           </style>
           <script>
-            setTimeout(function() {{
-              window.location.href = "{deep_link}";
-            }}, 700);
+            (function() {{
+              var deepLink = {deep_link!r};
+
+              function openApp() {{
+                window.location.replace(deepLink);
+              }}
+
+              window.addEventListener("load", function() {{
+                openApp();
+              }});
+
+              setTimeout(function() {{
+                openApp();
+              }}, 50);
+
+              setTimeout(function() {{
+                openApp();
+              }}, 300);
+            }})();
           </script>
         </head>
-        <body>
-          <h1>✅ Pago confirmado</h1>
-          <p>Ahora regresaremos a la app para mostrar tu código de recogida.</p>
-          <p><b>Código de recogida:</b> {order.pickup_code}</p>
-          <p><a class="btn" href="{deep_link}">Abrir QUING App</a></p>
-          <p class="muted">Si no se abre automáticamente, toca el botón.</p>
-        </body>
+        <body></body>
         </html>
         """
         return HTMLResponse(html)
@@ -856,7 +1001,6 @@ async def stripe_webhook(request: Request):
             try:
                 order, payment = _mark_order_paid_from_session(db, session_id)
                 if order:
-                    # Send note on webhook too (idempotent enough via note_status)
                     if order.customer_email and order.note_status in ("PENDING", "FAILED"):
                         ok, err = _send_note_email_if_configured(order)
                         if ok:
@@ -870,6 +1014,30 @@ async def stripe_webhook(request: Request):
             except Exception:
                 db.rollback()
                 logger.exception("webhook processing failed")
+            finally:
+                db.close()
+
+    if event_type == "payment_intent.succeeded":
+        obj = event["data"]["object"]
+        payment_intent_id = obj.get("id", "")
+
+        if SessionLocal and payment_intent_id:
+            db = SessionLocal()
+            try:
+                order, payment = _mark_order_paid_from_payment_intent(db, payment_intent_id)
+                if order:
+                    if order.customer_email and order.note_status in ("PENDING", "FAILED"):
+                        ok, err = _send_note_email_if_configured(order)
+                        if ok:
+                            _mark_note_status(db, order, "SENT", "")
+                        else:
+                            _mark_note_status(db, order, "FAILED", err)
+                    db.commit()
+                else:
+                    db.rollback()
+            except Exception:
+                db.rollback()
+                logger.exception("payment_intent webhook processing failed")
             finally:
                 db.close()
 
