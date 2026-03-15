@@ -1079,6 +1079,207 @@ def admin_inventory_sell(payload: dict, request: Request):
         db.close()
 
 
+
+
+def _dashboard_summary(db):
+    total_inventory_items = db.query(InventoryItem).count()
+    active_inventory_items = db.query(InventoryItem).filter(InventoryItem.active == True).count()
+    low_stock_items = db.query(InventoryItem).filter(InventoryItem.active == True, InventoryItem.stock > 0, InventoryItem.stock <= 5).count()
+    out_of_stock_items = db.query(InventoryItem).filter(InventoryItem.active == True, InventoryItem.stock <= 0).count()
+    total_stock_units = 0
+    total_inventory_value = 0
+    for item in db.query(InventoryItem).filter(InventoryItem.active == True).all():
+        stock = int(item.stock or 0)
+        price = int(item.price_mxn or 0)
+        total_stock_units += stock
+        total_inventory_value += stock * price
+
+    total_orders = db.query(Order).count()
+    paid_orders = db.query(Order).filter(Order.status == "PAID").count()
+    delivered_orders = db.query(Order).filter(Order.status == "DELIVERED").count()
+
+    total_sales_mxn = 0
+    for order in db.query(Order).filter(Order.status.in_(["PAID", "DELIVERED"])).all():
+        total_sales_mxn += int(order.total_mxn or 0)
+
+    return {
+        "total_inventory_items": total_inventory_items,
+        "active_inventory_items": active_inventory_items,
+        "low_stock_items": low_stock_items,
+        "out_of_stock_items": out_of_stock_items,
+        "total_stock_units": total_stock_units,
+        "total_inventory_value_mxn": total_inventory_value,
+        "total_orders": total_orders,
+        "paid_orders": paid_orders,
+        "delivered_orders": delivered_orders,
+        "total_sales_mxn": total_sales_mxn,
+    }
+
+
+def _top_sizes(db, limit: int = 20):
+    sales = {}
+    for order in db.query(Order).filter(Order.status.in_(["PAID", "DELIVERED"])).all():
+        for item in (order.items or []):
+            sku = str(getattr(item, "sku", "") or "").strip().upper()
+            qty = int(getattr(item, "qty", 0) or 0)
+            if not sku or qty <= 0:
+                continue
+            parts = sku.split("-")
+            size = parts[-1] if parts else ""
+            if not size:
+                continue
+            row = sales.setdefault(size, {"size": size, "qty_sold": 0, "skus": set()})
+            row["qty_sold"] += qty
+            row["skus"].add(sku)
+
+    rows = sorted(sales.values(), key=lambda x: (-x["qty_sold"], x["size"]))[:limit]
+    out = []
+    for row in rows:
+        out.append({"size": row["size"], "qty_sold": row["qty_sold"], "sku_count": len(row["skus"])})
+    return out
+
+
+def _sales_by_sku(db, limit: int = 20):
+    sales = {}
+    for order in db.query(Order).filter(Order.status.in_(["PAID", "DELIVERED"])).all():
+        for item in (order.items or []):
+            sku = str(getattr(item, "sku", "") or "").strip().upper()
+            qty = int(getattr(item, "qty", 0) or 0)
+            if not sku or qty <= 0:
+                continue
+            row = sales.setdefault(sku, {"sku": sku, "name": getattr(item, "name", ""), "qty_sold": 0})
+            row["qty_sold"] += qty
+
+    return sorted(sales.values(), key=lambda x: (-x["qty_sold"], x["sku"]))[:limit]
+
+
+
+@app.get("/admin/dashboard/summary")
+def admin_dashboard_summary(request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    db = SessionLocal()
+    try:
+        return {"ok": True, "summary": _dashboard_summary(db)}
+    finally:
+        db.close()
+
+
+@app.get("/admin/dashboard/top-sizes")
+def admin_dashboard_top_sizes(request: Request, limit: int = 20):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    limit = max(1, min(int(limit or 20), 100))
+    db = SessionLocal()
+    try:
+        rows = _top_sizes(db, limit=limit)
+        return {"ok": True, "count": len(rows), "rows": rows}
+    finally:
+        db.close()
+
+
+@app.get("/admin/dashboard/top-skus")
+def admin_dashboard_top_skus(request: Request, limit: int = 20):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    limit = max(1, min(int(limit or 20), 100))
+    db = SessionLocal()
+    try:
+        rows = _sales_by_sku(db, limit=limit)
+        return {"ok": True, "count": len(rows), "rows": rows}
+    finally:
+        db.close()
+
+
+@app.post("/admin/inventory/set-stock")
+def admin_inventory_set_stock(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    payload = payload or {}
+    sku = _normalize_code(payload.get("sku"), upper=True)
+    barcode = _normalize_code(payload.get("barcode"), upper=True)
+
+    try:
+        stock = int(payload.get("stock", 0))
+    except Exception:
+        raise HTTPException(status_code=400, detail="stock must be integer")
+
+    if stock < 0:
+        raise HTTPException(status_code=400, detail="stock must be >= 0")
+
+    db = SessionLocal()
+    try:
+        item = None
+        if sku:
+            item = db.query(InventoryItem).filter(InventoryItem.sku == sku).first()
+        elif barcode:
+            item = db.query(InventoryItem).filter(InventoryItem.barcode == barcode).first()
+        else:
+            raise HTTPException(status_code=400, detail="sku or barcode is required")
+
+        if not item:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+
+        before_stock = int(item.stock or 0)
+        item.stock = stock
+        item.updated_at = _now_utc()
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return {"ok": True, "before_stock": before_stock, "after_stock": int(item.stock or 0), "item": _inventory_to_dict(item)}
+    finally:
+        db.close()
+
+
+@app.post("/admin/inventory/set-price")
+def admin_inventory_set_price(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    payload = payload or {}
+    sku = _normalize_code(payload.get("sku"), upper=True)
+    barcode = _normalize_code(payload.get("barcode"), upper=True)
+
+    try:
+        price_mxn = int(round(float(payload.get("price_mxn", payload.get("price", 0)))))
+    except Exception:
+        raise HTTPException(status_code=400, detail="price_mxn must be numeric")
+
+    if price_mxn < 0:
+        raise HTTPException(status_code=400, detail="price_mxn must be >= 0")
+
+    db = SessionLocal()
+    try:
+        item = None
+        if sku:
+            item = db.query(InventoryItem).filter(InventoryItem.sku == sku).first()
+        elif barcode:
+            item = db.query(InventoryItem).filter(InventoryItem.barcode == barcode).first()
+        else:
+            raise HTTPException(status_code=400, detail="sku or barcode is required")
+
+        if not item:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+
+        before_price = int(item.price_mxn or 0)
+        item.price_mxn = price_mxn
+        item.updated_at = _now_utc()
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return {"ok": True, "before_price_mxn": before_price, "after_price_mxn": int(item.price_mxn or 0), "item": _inventory_to_dict(item)}
+    finally:
+        db.close()
+
 # -------------------------
 # Admin endpoints (TEMP)
 # -------------------------
