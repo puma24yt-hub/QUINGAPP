@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 import re
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, ForeignKey, text
+    create_engine, Column, Integer, String, DateTime, ForeignKey, text, Boolean
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -117,6 +117,23 @@ class Payment(Base):
     order = relationship("Order", back_populates="payments")
 
 
+class InventoryItem(Base):
+    __tablename__ = "inventory_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    school_code = Column(String(20), nullable=False, default="")
+    product_type = Column(String(20), nullable=False, default="")
+    size = Column(String(20), nullable=False, default="")
+    gender = Column(String(10), nullable=True)
+    sku = Column(String(80), nullable=False, unique=True)
+    barcode = Column(String(80), nullable=False, unique=True)
+    stock = Column(Integer, nullable=False, default=0)
+    price_mxn = Column(Integer, nullable=False, default=0)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 engine = None
 SessionLocal = None
 
@@ -156,6 +173,155 @@ def _is_valid_email(email: str) -> bool:
         return False
     # Simple validation (good enough for MVP)
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email) is not None
+
+
+def _normalize_code(value: str, upper: bool = True) -> str:
+    value = str(value or "").strip()
+    if upper:
+        value = value.upper()
+    value = re.sub(r"\s+", "", value)
+    return value
+
+
+def _normalize_size(value: str) -> str:
+    value = _normalize_code(value, upper=True)
+    return value
+
+
+def _normalize_gender(value: str):
+    value = _normalize_code(value, upper=True)
+    return value or None
+
+
+def _build_inventory_sku(school_code: str, product_type: str, size: str, gender: str = None) -> str:
+    school_code = _normalize_code(school_code, upper=True)
+    product_type = _normalize_code(product_type, upper=True)
+    size = _normalize_size(size)
+    gender = _normalize_gender(gender)
+
+    if not school_code:
+        raise HTTPException(status_code=400, detail="school_code is required")
+    if not product_type:
+        raise HTTPException(status_code=400, detail="product_type is required")
+    if not size:
+        raise HTTPException(status_code=400, detail="size is required")
+
+    if gender:
+        return f"{school_code}-{product_type}-{gender}-{size}"
+    return f"{school_code}-{product_type}-{size}"
+
+
+def _inventory_to_dict(item: InventoryItem):
+    return {
+        "id": item.id,
+        "school_code": item.school_code,
+        "product_type": item.product_type,
+        "size": item.size,
+        "gender": item.gender,
+        "sku": item.sku,
+        "barcode": item.barcode,
+        "stock": item.stock,
+        "price_mxn": item.price_mxn,
+        "active": bool(item.active),
+        "created_at": _dt(item.created_at),
+        "updated_at": _dt(item.updated_at),
+    }
+
+
+def _validate_inventory_payload(payload: dict, partial: bool = False):
+    payload = payload or {}
+
+    school_code = payload.get("school_code")
+    product_type = payload.get("product_type")
+    size = payload.get("size")
+    gender = payload.get("gender")
+    stock = payload.get("stock")
+    price_mxn = payload.get("price_mxn")
+    active = payload.get("active")
+    barcode = payload.get("barcode")
+
+    data = {}
+
+    if not partial or school_code is not None:
+        school_code = _normalize_code(school_code, upper=True)
+        if not school_code:
+            raise HTTPException(status_code=400, detail="school_code is required")
+        data["school_code"] = school_code
+
+    if not partial or product_type is not None:
+        product_type = _normalize_code(product_type, upper=True)
+        if not product_type:
+            raise HTTPException(status_code=400, detail="product_type is required")
+        data["product_type"] = product_type
+
+    if not partial or size is not None:
+        size = _normalize_size(size)
+        if not size:
+            raise HTTPException(status_code=400, detail="size is required")
+        data["size"] = size
+
+    if gender is not None or not partial:
+        data["gender"] = _normalize_gender(gender)
+
+    if not partial or stock is not None:
+        try:
+            stock = int(stock if stock is not None else 0)
+        except Exception:
+            raise HTTPException(status_code=400, detail="stock must be integer")
+        if stock < 0:
+            raise HTTPException(status_code=400, detail="stock must be >= 0")
+        data["stock"] = stock
+
+    if not partial or price_mxn is not None:
+        try:
+            price_mxn = int(round(float(price_mxn if price_mxn is not None else 0)))
+        except Exception:
+            raise HTTPException(status_code=400, detail="price_mxn must be numeric")
+        if price_mxn < 0:
+            raise HTTPException(status_code=400, detail="price_mxn must be >= 0")
+        data["price_mxn"] = price_mxn
+
+    if active is not None or not partial:
+        if isinstance(active, bool):
+            data["active"] = active
+        else:
+            active_text = str(active if active is not None else "true").strip().lower()
+            data["active"] = active_text in ("1", "true", "yes", "y", "on")
+
+    if barcode is not None:
+        barcode = _normalize_code(barcode, upper=True)
+        data["barcode"] = barcode or None
+
+    return data
+
+
+def _apply_inventory_fields(item: InventoryItem, data: dict):
+    school_code = data.get("school_code", item.school_code)
+    product_type = data.get("product_type", item.product_type)
+    size = data.get("size", item.size)
+    gender = data.get("gender", item.gender)
+
+    sku = _build_inventory_sku(school_code, product_type, size, gender)
+
+    item.school_code = school_code
+    item.product_type = product_type
+    item.size = size
+    item.gender = gender
+    item.sku = sku
+    item.barcode = data.get("barcode") or sku
+
+    if "stock" in data:
+        item.stock = int(data["stock"])
+    if "price_mxn" in data:
+        item.price_mxn = int(data["price_mxn"])
+    if "active" in data:
+        item.active = bool(data["active"])
+
+    item.updated_at = _now_utc()
+    if not getattr(item, "created_at", None):
+        item.created_at = _now_utc()
+
+    return item
 
 
 def _order_to_dict(o: Order):
@@ -320,7 +486,6 @@ def _ensure_unique_pickup_fields(db):
             return code, token
 
 
-
 def _validate_checkout_payload(payload: dict):
     items = payload.get("items") or []
     if not isinstance(items, list) or len(items) == 0:
@@ -456,6 +621,227 @@ def root():
         "service": "QUINGAPP backend",
         "docs": "/docs",
     }
+
+
+# -------------------------
+# Inventory admin endpoints
+# -------------------------
+@app.get("/admin/inventory")
+def admin_list_inventory(request: Request, limit: int = 100, active_only: bool = False, school_code: str = "", product_type: str = ""):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    limit = max(1, min(int(limit or 100), 500))
+    school_code = _normalize_code(school_code, upper=True)
+    product_type = _normalize_code(product_type, upper=True)
+
+    db = SessionLocal()
+    try:
+        q = db.query(InventoryItem)
+
+        if active_only:
+            q = q.filter(InventoryItem.active == True)
+        if school_code:
+            q = q.filter(InventoryItem.school_code == school_code)
+        if product_type:
+            q = q.filter(InventoryItem.product_type == product_type)
+
+        items = q.order_by(InventoryItem.id.desc()).limit(limit).all()
+        return {"ok": True, "count": len(items), "items": [_inventory_to_dict(x) for x in items]}
+    finally:
+        db.close()
+
+
+@app.get("/admin/inventory/{item_id}")
+def admin_get_inventory_item(item_id: int, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    db = SessionLocal()
+    try:
+        item = db.query(InventoryItem).filter(InventoryItem.id == int(item_id)).first()
+        if not item:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+        return {"ok": True, "item": _inventory_to_dict(item)}
+    finally:
+        db.close()
+
+
+@app.post("/admin/inventory")
+def admin_create_inventory_item(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    data = _validate_inventory_payload(payload, partial=False)
+    db = SessionLocal()
+    try:
+        item = InventoryItem(
+            school_code="",
+            product_type="",
+            size="",
+            gender=None,
+            sku="",
+            barcode="",
+            stock=0,
+            price_mxn=0,
+            active=True,
+            created_at=_now_utc(),
+            updated_at=_now_utc(),
+        )
+        _apply_inventory_fields(item, data)
+
+        existing_sku = db.query(InventoryItem).filter(InventoryItem.sku == item.sku).first()
+        if existing_sku:
+            raise HTTPException(status_code=400, detail="SKU already exists")
+
+        existing_barcode = db.query(InventoryItem).filter(InventoryItem.barcode == item.barcode).first()
+        if existing_barcode:
+            raise HTTPException(status_code=400, detail="Barcode already exists")
+
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return {"ok": True, "item": _inventory_to_dict(item)}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("admin_create_inventory_item failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.put("/admin/inventory/{item_id}")
+def admin_update_inventory_item(item_id: int, payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    data = _validate_inventory_payload(payload, partial=True)
+    db = SessionLocal()
+    try:
+        item = db.query(InventoryItem).filter(InventoryItem.id == int(item_id)).first()
+        if not item:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+
+        _apply_inventory_fields(item, data)
+
+        existing_sku = (
+            db.query(InventoryItem)
+            .filter(InventoryItem.sku == item.sku, InventoryItem.id != item.id)
+            .first()
+        )
+        if existing_sku:
+            raise HTTPException(status_code=400, detail="SKU already exists")
+
+        existing_barcode = (
+            db.query(InventoryItem)
+            .filter(InventoryItem.barcode == item.barcode, InventoryItem.id != item.id)
+            .first()
+        )
+        if existing_barcode:
+            raise HTTPException(status_code=400, detail="Barcode already exists")
+
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return {"ok": True, "item": _inventory_to_dict(item)}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("admin_update_inventory_item failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/admin/inventory/lookup")
+def admin_inventory_lookup(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    payload = payload or {}
+    barcode = _normalize_code(payload.get("barcode"), upper=True)
+    sku = _normalize_code(payload.get("sku"), upper=True)
+
+    if not barcode and not sku:
+        raise HTTPException(status_code=400, detail="barcode or sku is required")
+
+    db = SessionLocal()
+    try:
+        q = db.query(InventoryItem)
+        item = q.filter(InventoryItem.barcode == barcode).first() if barcode else q.filter(InventoryItem.sku == sku).first()
+        if not item:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+        return {"ok": True, "item": _inventory_to_dict(item)}
+    finally:
+        db.close()
+
+
+@app.post("/admin/inventory/adjust-stock")
+def admin_inventory_adjust_stock(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    payload = payload or {}
+    item_id = payload.get("item_id")
+    barcode = _normalize_code(payload.get("barcode"), upper=True)
+    sku = _normalize_code(payload.get("sku"), upper=True)
+
+    try:
+        delta = int(payload.get("delta", 0))
+    except Exception:
+        raise HTTPException(status_code=400, detail="delta must be integer")
+
+    if delta == 0:
+        raise HTTPException(status_code=400, detail="delta must not be 0")
+
+    db = SessionLocal()
+    try:
+        item = None
+
+        if item_id is not None:
+            try:
+                item = db.query(InventoryItem).filter(InventoryItem.id == int(item_id)).first()
+            except Exception:
+                raise HTTPException(status_code=400, detail="item_id invalid")
+        elif barcode:
+            item = db.query(InventoryItem).filter(InventoryItem.barcode == barcode).first()
+        elif sku:
+            item = db.query(InventoryItem).filter(InventoryItem.sku == sku).first()
+        else:
+            raise HTTPException(status_code=400, detail="item_id or barcode or sku is required")
+
+        if not item:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+
+        new_stock = item.stock + delta
+        if new_stock < 0:
+            raise HTTPException(status_code=400, detail="Insufficient stock")
+
+        item.stock = new_stock
+        item.updated_at = _now_utc()
+
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+
+        return {
+            "ok": True,
+            "delta": delta,
+            "item": _inventory_to_dict(item),
+        }
+    finally:
+        db.close()
 
 
 # -------------------------
