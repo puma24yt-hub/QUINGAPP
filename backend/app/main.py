@@ -162,6 +162,37 @@ else:
     logger.warning("DATABASE_URL not configured — DB endpoints will fail until configured.")
 
 
+class PosSale(Base):
+    __tablename__ = "pos_sales"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    folio = Column(String(64), nullable=False, unique=True)
+    payment_method = Column(String(32), nullable=False, default="CASH")
+    employee_name = Column(String(120), nullable=False, default="")
+    items_count = Column(Integer, nullable=False, default=0)
+    total_mxn = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    items = relationship("PosSaleItem", back_populates="sale", cascade="all, delete-orphan")
+
+
+class PosSaleItem(Base):
+    __tablename__ = "pos_sale_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sale_id = Column(Integer, ForeignKey("pos_sales.id"), nullable=False)
+
+    sku = Column(String(80), nullable=False, default="")
+    barcode = Column(String(80), nullable=False, default="")
+    name = Column(String(250), nullable=False, default="")
+    qty = Column(Integer, nullable=False, default=1)
+    unit_price_mxn = Column(Integer, nullable=False, default=0)
+    line_total_mxn = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    sale = relationship("PosSale", back_populates="items")
+
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -239,6 +270,17 @@ def _build_inventory_sku(school_code: str, product_type: str, size: str, gender:
     if gender:
         return f"{school_code}-{product_type}-{gender}-{size}"
     return f"{school_code}-{product_type}-{size}"
+
+
+def _inventory_title_for_sale(item: InventoryItem):
+    parts = []
+    if str(item.school_code or "").strip():
+        parts.append(str(item.school_code).strip())
+    if str(item.product_type or "").strip():
+        parts.append(str(item.product_type).strip())
+    if str(item.size or "").strip():
+        parts.append(f"Talla {str(item.size).strip()}")
+    return " • ".join(parts) if parts else str(item.sku or "").strip()
 
 
 def _inventory_to_dict(item: InventoryItem):
@@ -352,6 +394,46 @@ def _apply_inventory_fields(item: InventoryItem, data: dict):
         item.created_at = _now_utc()
 
     return item
+
+
+def _gen_pos_folio():
+    return "POS-" + _now_utc().strftime("%y%m%d-%H%M%S") + "-" + secrets.token_hex(2).upper()
+
+
+def _pos_sale_item_to_dict(it: "PosSaleItem"):
+    return {
+        "id": it.id,
+        "sku": it.sku,
+        "barcode": it.barcode,
+        "name": it.name,
+        "qty": int(it.qty or 0),
+        "unit_price_mxn": int(it.unit_price_mxn or 0),
+        "line_total_mxn": int(it.line_total_mxn or 0),
+        "created_at": _dt(it.created_at),
+    }
+
+
+def _pos_sale_to_dict(sale: "PosSale"):
+    return {
+        "id": sale.id,
+        "folio": sale.folio,
+        "payment_method": sale.payment_method,
+        "employee_name": sale.employee_name,
+        "items_count": int(sale.items_count or 0),
+        "total_mxn": int(sale.total_mxn or 0),
+        "created_at": _dt(sale.created_at),
+        "items": [_pos_sale_item_to_dict(it) for it in (sale.items or [])],
+    }
+
+
+def _start_of_today_utc():
+    now = _now_utc()
+    return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+
+def _start_of_month_utc():
+    now = _now_utc()
+    return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
 
 def _order_to_dict(o: Order):
@@ -1081,6 +1163,181 @@ def admin_inventory_sell(payload: dict, request: Request):
 
 
 
+
+
+
+@app.post("/admin/pos/checkout")
+def admin_pos_checkout(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    payload = payload or {}
+    items = payload.get("items") or []
+    payment_method = _normalize_code(payload.get("payment_method") or "CASH", upper=True) or "CASH"
+    employee_name = str(payload.get("employee_name", "") or "").strip()
+
+    if not isinstance(items, list) or len(items) == 0:
+        raise HTTPException(status_code=400, detail="items is required")
+
+    db = SessionLocal()
+    try:
+        prepared_items = []
+        total_mxn = 0
+        total_units = 0
+
+        for raw in items:
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=400, detail="items contains invalid row")
+
+            sku = _normalize_code(raw.get("sku"), upper=True)
+            barcode = _normalize_code(raw.get("barcode"), upper=True)
+            try:
+                qty = int(raw.get("qty", 1))
+            except Exception:
+                raise HTTPException(status_code=400, detail="qty must be integer")
+
+            if qty <= 0:
+                raise HTTPException(status_code=400, detail="qty must be >= 1")
+
+            item = None
+            if sku:
+                item = db.query(InventoryItem).filter(InventoryItem.sku == sku).first()
+            elif barcode:
+                item = db.query(InventoryItem).filter(InventoryItem.barcode == barcode).first()
+            else:
+                raise HTTPException(status_code=400, detail="each item requires sku or barcode")
+
+            if not item:
+                raise HTTPException(status_code=404, detail=f"Inventory item not found: {sku or barcode}")
+
+            if not bool(item.active):
+                raise HTTPException(status_code=400, detail=f"Inventory item inactive: {item.sku}")
+
+            before_stock = int(item.stock or 0)
+            if before_stock < qty:
+                raise HTTPException(status_code=400, detail=f"Insufficient stock for {item.sku}")
+
+            unit_price_mxn = int(item.price_mxn or 0)
+            line_total_mxn = unit_price_mxn * qty
+
+            prepared_items.append({
+                "item": item,
+                "qty": qty,
+                "before_stock": before_stock,
+                "unit_price_mxn": unit_price_mxn,
+                "line_total_mxn": line_total_mxn,
+            })
+            total_mxn += line_total_mxn
+            total_units += qty
+
+        sale = PosSale(
+            folio=_gen_pos_folio(),
+            payment_method=payment_method,
+            employee_name=employee_name,
+            items_count=total_units,
+            total_mxn=total_mxn,
+            created_at=_now_utc(),
+        )
+        db.add(sale)
+        db.flush()
+
+        for row in prepared_items:
+            item = row["item"]
+            qty = row["qty"]
+            item.stock = int(item.stock or 0) - qty
+            item.updated_at = _now_utc()
+            db.add(item)
+
+            db.add(PosSaleItem(
+                sale_id=sale.id,
+                sku=item.sku,
+                barcode=item.barcode,
+                name=_inventory_title_for_sale(item),
+                qty=qty,
+                unit_price_mxn=int(row["unit_price_mxn"]),
+                line_total_mxn=int(row["line_total_mxn"]),
+                created_at=_now_utc(),
+            ))
+
+        db.commit()
+        db.refresh(sale)
+        return {"ok": True, "sale": _pos_sale_to_dict(sale)}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("admin_pos_checkout failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/admin/pos/sales")
+def admin_list_pos_sales(request: Request, limit: int = 50):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    limit = max(1, min(int(limit or 50), 200))
+    db = SessionLocal()
+    try:
+        rows = db.query(PosSale).order_by(PosSale.id.desc()).limit(limit).all()
+        return {"ok": True, "count": len(rows), "sales": [_pos_sale_to_dict(x) for x in rows]}
+    finally:
+        db.close()
+
+
+@app.get("/admin/dashboard/pos-today")
+def admin_dashboard_pos_today(request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    db = SessionLocal()
+    try:
+        return {"ok": True, "summary": _pos_sales_total_between(db, _start_of_today_utc(), None)}
+    finally:
+        db.close()
+
+
+@app.get("/admin/dashboard/pos-month")
+def admin_dashboard_pos_month(request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    db = SessionLocal()
+    try:
+        return {"ok": True, "summary": _pos_sales_total_between(db, _start_of_month_utc(), None)}
+    finally:
+        db.close()
+
+
+@app.get("/admin/dashboard/pos-top-products")
+def admin_dashboard_pos_top_products(request: Request, limit: int = 20):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    limit = max(1, min(int(limit or 20), 100))
+    db = SessionLocal()
+    try:
+        rows = _pos_top_products(db, limit=limit)
+        return {"ok": True, "count": len(rows), "rows": rows}
+    finally:
+        db.close()
+
+
+@app.get("/admin/dashboard/pos-top-sizes")
+def admin_dashboard_pos_top_sizes(request: Request, limit: int = 20):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    limit = max(1, min(int(limit or 20), 100))
+    db = SessionLocal()
+    try:
+        rows = _pos_top_sizes(db, limit=limit)
+        return {"ok": True, "count": len(rows), "rows": rows}
+    finally:
+        db.close()
 def _dashboard_summary(db):
     total_inventory_items = db.query(InventoryItem).count()
     active_inventory_items = db.query(InventoryItem).filter(InventoryItem.active == True).count()
@@ -1098,9 +1355,24 @@ def _dashboard_summary(db):
     paid_orders = db.query(Order).filter(Order.status == "PAID").count()
     delivered_orders = db.query(Order).filter(Order.status == "DELIVERED").count()
 
-    total_sales_mxn = 0
+    online_sales_mxn = 0
     for order in db.query(Order).filter(Order.status.in_(["PAID", "DELIVERED"])).all():
-        total_sales_mxn += int(order.total_mxn or 0)
+        online_sales_mxn += int(order.total_mxn or 0)
+
+    pos_sales_count = db.query(PosSale).count()
+    pos_sales_mxn = 0
+    for sale in db.query(PosSale).all():
+        pos_sales_mxn += int(sale.total_mxn or 0)
+
+    today_start = _start_of_today_utc()
+    month_start = _start_of_month_utc()
+    pos_today_sales_mxn = 0
+    pos_month_sales_mxn = 0
+    for sale in db.query(PosSale).filter(PosSale.created_at >= month_start).all():
+        total = int(sale.total_mxn or 0)
+        pos_month_sales_mxn += total
+        if sale.created_at and sale.created_at >= today_start:
+            pos_today_sales_mxn += total
 
     return {
         "total_inventory_items": total_inventory_items,
@@ -1112,7 +1384,12 @@ def _dashboard_summary(db):
         "total_orders": total_orders,
         "paid_orders": paid_orders,
         "delivered_orders": delivered_orders,
-        "total_sales_mxn": total_sales_mxn,
+        "online_sales_mxn": online_sales_mxn,
+        "pos_sales_count": pos_sales_count,
+        "pos_sales_mxn": pos_sales_mxn,
+        "pos_today_sales_mxn": pos_today_sales_mxn,
+        "pos_month_sales_mxn": pos_month_sales_mxn,
+        "grand_total_sales_mxn": online_sales_mxn + pos_sales_mxn,
     }
 
 
@@ -1154,6 +1431,53 @@ def _sales_by_sku(db, limit: int = 20):
 
 
 
+
+
+def _pos_top_products(db, limit: int = 20):
+    sales = {}
+    for sale in db.query(PosSale).all():
+        for item in (sale.items or []):
+            sku = str(getattr(item, "sku", "") or "").strip().upper()
+            qty = int(getattr(item, "qty", 0) or 0)
+            name = str(getattr(item, "name", "") or "").strip()
+            if not sku or qty <= 0:
+                continue
+            row = sales.setdefault(sku, {"sku": sku, "name": name, "qty_sold": 0, "sales_mxn": 0})
+            row["qty_sold"] += qty
+            row["sales_mxn"] += int(getattr(item, "line_total_mxn", 0) or 0)
+    return sorted(sales.values(), key=lambda x: (-x["qty_sold"], -x["sales_mxn"], x["sku"]))[:limit]
+
+
+def _pos_top_sizes(db, limit: int = 20):
+    sales = {}
+    for sale in db.query(PosSale).all():
+        for item in (sale.items or []):
+            sku = str(getattr(item, "sku", "") or "").strip().upper()
+            qty = int(getattr(item, "qty", 0) or 0)
+            if not sku or qty <= 0:
+                continue
+            parts = sku.split("-")
+            size = parts[-1] if parts else ""
+            if not size:
+                continue
+            row = sales.setdefault(size, {"size": size, "qty_sold": 0, "sku_count": set()})
+            row["qty_sold"] += qty
+            row["sku_count"].add(sku)
+    rows = sorted(sales.values(), key=lambda x: (-x["qty_sold"], x["size"]))[:limit]
+    return [{"size": r["size"], "qty_sold": r["qty_sold"], "sku_count": len(r["sku_count"])} for r in rows]
+
+
+def _pos_sales_total_between(db, start_dt, end_dt=None):
+    q = db.query(PosSale)
+    if start_dt is not None:
+        q = q.filter(PosSale.created_at >= start_dt)
+    if end_dt is not None:
+        q = q.filter(PosSale.created_at < end_dt)
+    rows = q.all()
+    total_mxn = sum(int(r.total_mxn or 0) for r in rows)
+    total_tickets = len(rows)
+    total_items = sum(int(r.items_count or 0) for r in rows)
+    return {"total_mxn": total_mxn, "tickets": total_tickets, "items_count": total_items}
 @app.get("/admin/dashboard/summary")
 def admin_dashboard_summary(request: Request):
     _require_admin(request)
