@@ -606,6 +606,36 @@ def _validate_checkout_payload(payload: dict):
     }
 
 
+
+
+def _assert_inventory_available_for_checkout(db, items):
+    items = items or []
+    sku_rows = []
+    for it in items:
+        sku = str((it or {}).get("sku", "") or "").strip().upper()
+        qty = int((it or {}).get("qty", 0) or 0)
+        if not sku:
+            continue
+        if qty <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid qty for SKU: {sku}")
+        sku_rows.append((sku, qty))
+
+    if not sku_rows:
+        return
+
+    merged = {}
+    for sku, qty in sku_rows:
+        merged[sku] = merged.get(sku, 0) + qty
+
+    for sku, qty in merged.items():
+        inv = db.query(InventoryItem).filter(InventoryItem.sku == sku).first()
+        if not inv:
+            raise HTTPException(status_code=400, detail=f"Producto no encontrado en inventario: {sku}")
+        if not bool(inv.active):
+            raise HTTPException(status_code=400, detail=f"Producto inactivo: {sku}")
+        if int(inv.stock or 0) < qty:
+            raise HTTPException(status_code=400, detail=f"Stock insuficiente para {sku}. Disponible: {int(inv.stock or 0)}")
+
 def _create_pending_order(db, checkout_data: dict):
     pickup_code, pickup_token = _ensure_unique_pickup_fields(db)
 
@@ -1310,6 +1340,7 @@ async def create_checkout(payload: dict):
 
     db = SessionLocal()
     try:
+        _assert_inventory_available_for_checkout(db, checkout_data["cleaned_items"])
         order, pickup_code, pickup_token = _create_pending_order(db, checkout_data)
 
         success_url = f"{os.getenv('BASE_URL', '').rstrip('/')}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}"
@@ -1374,6 +1405,7 @@ async def create_mobile_checkout(payload: dict):
 
     db = SessionLocal()
     try:
+        _assert_inventory_available_for_checkout(db, checkout_data["cleaned_items"])
         order, pickup_code, pickup_token = _create_pending_order(db, checkout_data)
 
         customer = stripe.Customer.create(
