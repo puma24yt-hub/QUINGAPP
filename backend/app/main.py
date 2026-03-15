@@ -779,6 +779,50 @@ def root():
 # -------------------------
 # Inventory admin endpoints
 # -------------------------
+
+
+@app.get("/admin/setup-pos")
+def admin_setup_pos(request: Request):
+    _require_admin(request)
+    if not engine:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS pos_sales (
+                    id SERIAL PRIMARY KEY,
+                    folio VARCHAR(64) NOT NULL UNIQUE,
+                    payment_method VARCHAR(32) NOT NULL DEFAULT 'CASH',
+                    employee_name VARCHAR(120) NOT NULL DEFAULT '',
+                    items_count INTEGER NOT NULL DEFAULT 0,
+                    total_mxn INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS pos_sale_items (
+                    id SERIAL PRIMARY KEY,
+                    sale_id INTEGER NOT NULL REFERENCES pos_sales(id) ON DELETE CASCADE,
+                    sku VARCHAR(80) NOT NULL DEFAULT '',
+                    barcode VARCHAR(80) NOT NULL DEFAULT '',
+                    name VARCHAR(250) NOT NULL DEFAULT '',
+                    qty INTEGER NOT NULL DEFAULT 1,
+                    unit_price_mxn INTEGER NOT NULL DEFAULT 0,
+                    line_total_mxn INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL
+                )
+            """))
+
+        return {
+            "ok": True,
+            "message": "POS tables ready",
+            "tables": ["pos_sales", "pos_sale_items"],
+        }
+    except Exception as e:
+        logger.exception("admin_setup_pos failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/admin/inventory")
 def admin_list_inventory(request: Request, limit: int = 100, active_only: bool = False, school_code: str = "", product_type: str = ""):
     _require_admin(request)
