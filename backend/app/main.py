@@ -83,6 +83,7 @@ class Order(Base):
     note_sent_at = Column(DateTime(timezone=True), nullable=True)
     note_status = Column(String(32), nullable=False, default="PENDING")  # PENDING | SENT | FAILED | SKIPPED
     note_error = Column(String(500), nullable=False, default="")
+    inventory_deducted_at = Column(DateTime(timezone=True), nullable=True)
 
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
     payments = relationship("Payment", back_populates="order", cascade="all, delete-orphan")
@@ -95,6 +96,7 @@ class OrderItem(Base):
     order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
 
     name = Column(String(250), nullable=False)
+    sku = Column(String(80), nullable=False, default="")
     qty = Column(Integer, nullable=False, default=1)
     unit_amount_mxn = Column(Integer, nullable=False, default=0)  # pesos
 
@@ -150,6 +152,12 @@ if DATABASE_URL:
     engine = create_engine(db_url, pool_pre_ping=True, future=True, connect_args=connect_args)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     Base.metadata.create_all(bind=engine)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS inventory_deducted_at TIMESTAMPTZ NULL"))
+            conn.execute(text("ALTER TABLE order_items ADD COLUMN IF NOT EXISTS sku VARCHAR(80) NOT NULL DEFAULT ''"))
+    except Exception:
+        logger.exception("runtime schema sync failed")
 else:
     logger.warning("DATABASE_URL not configured — DB endpoints will fail until configured.")
 
@@ -364,8 +372,9 @@ def _order_to_dict(o: Order):
         "note_sent_at": _dt(o.note_sent_at),
         "note_status": o.note_status,
         "note_error": o.note_error,
+        "inventory_deducted_at": _dt(o.inventory_deducted_at),
         "items": [
-            {"id": it.id, "name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
+            {"id": it.id, "name": it.name, "sku": it.sku, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
             for it in (o.items or [])
         ],
         "payments": [
@@ -399,8 +408,9 @@ def _order_public_to_dict(o: Order):
         "pickup_token": o.pickup_token,
         "note_sent_at": _dt(o.note_sent_at),
         "note_status": o.note_status,
+        "inventory_deducted_at": _dt(o.inventory_deducted_at),
         "items": [
-            {"name": it.name, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
+            {"name": it.name, "sku": it.sku, "qty": it.qty, "unit_amount_mxn": it.unit_amount_mxn}
             for it in (o.items or [])
         ],
     }
@@ -418,6 +428,41 @@ def _maybe_mark_expired(db, o: Order) -> bool:
         db.add(o)
         return True
     return False
+
+
+
+def _deduct_inventory_for_paid_order(db, order: Order):
+    if not order:
+        return False
+
+    if getattr(order, "inventory_deducted_at", None):
+        return False
+
+    order_items = list(order.items or [])
+    order_items_with_sku = [it for it in order_items if str(getattr(it, "sku", "") or "").strip()]
+    if not order_items_with_sku:
+        return False
+
+    inventory_rows = []
+    for it in order_items_with_sku:
+        sku = str(it.sku or "").strip().upper()
+        inv = db.query(InventoryItem).filter(InventoryItem.sku == sku).first()
+        if not inv:
+            raise HTTPException(status_code=400, detail=f"Inventory SKU not found for paid order: {sku}")
+        if not bool(inv.active):
+            raise HTTPException(status_code=400, detail=f"Inventory SKU inactive for paid order: {sku}")
+        if int(inv.stock or 0) < int(it.qty or 0):
+            raise HTTPException(status_code=400, detail=f"Insufficient stock for paid order SKU: {sku}")
+        inventory_rows.append((inv, int(it.qty or 0)))
+
+    for inv, qty in inventory_rows:
+        inv.stock = int(inv.stock or 0) - qty
+        inv.updated_at = _now_utc()
+        db.add(inv)
+
+    order.inventory_deducted_at = _now_utc()
+    db.add(order)
+    return True
 
 
 def _get_or_create_payment_record(db, order_id: int, stripe_session_id: str):
@@ -460,6 +505,7 @@ def _record_payment_snapshot(db, order: Order, stripe_session_id: str):
             order.expires_at = order.paid_at + timedelta(days=60)
         if order.pickup_status != "DELIVERED":
             order.pickup_status = "ACTIVE"
+        _deduct_inventory_for_paid_order(db, order)
 
     db.add(order)
     db.add(payment)
@@ -529,6 +575,7 @@ def _validate_checkout_payload(payload: dict):
 
     for it in items:
         name = str(it.get("name", "")).strip()
+        sku = _normalize_code(it.get("sku"), upper=True)
         qty = int(it.get("qty", 0) or 0)
         unit_amount_mxn = float(it.get("unit_amount_mxn", it.get("unit_price_mxn", 0)) or 0)
 
@@ -538,7 +585,7 @@ def _validate_checkout_payload(payload: dict):
         unit_amount_pesos = int(round(unit_amount_mxn))
         total_mxn += unit_amount_pesos * qty
 
-        cleaned_items.append({"name": name, "qty": qty, "unit_amount_mxn": unit_amount_pesos})
+        cleaned_items.append({"name": name, "sku": sku, "qty": qty, "unit_amount_mxn": unit_amount_pesos})
 
         line_items.append({
             "price_data": {
@@ -581,6 +628,7 @@ def _create_pending_order(db, checkout_data: dict):
         db.add(OrderItem(
             order_id=order.id,
             name=it["name"],
+            sku=it.get("sku", ""),
             qty=it["qty"],
             unit_amount_mxn=it["unit_amount_mxn"],
         ))
@@ -627,6 +675,7 @@ def _mark_order_paid_from_payment_intent(db, payment_intent_id: str):
             order.expires_at = order.paid_at + timedelta(days=60)
         if order.pickup_status != "DELIVERED":
             order.pickup_status = "ACTIVE"
+        _deduct_inventory_for_paid_order(db, order)
 
     db.add(order)
     db.add(payment)
