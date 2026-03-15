@@ -606,36 +606,6 @@ def _validate_checkout_payload(payload: dict):
     }
 
 
-
-
-def _assert_inventory_available_for_checkout(db, items):
-    items = items or []
-    sku_rows = []
-    for it in items:
-        sku = str((it or {}).get("sku", "") or "").strip().upper()
-        qty = int((it or {}).get("qty", 0) or 0)
-        if not sku:
-            continue
-        if qty <= 0:
-            raise HTTPException(status_code=400, detail=f"Invalid qty for SKU: {sku}")
-        sku_rows.append((sku, qty))
-
-    if not sku_rows:
-        return
-
-    merged = {}
-    for sku, qty in sku_rows:
-        merged[sku] = merged.get(sku, 0) + qty
-
-    for sku, qty in merged.items():
-        inv = db.query(InventoryItem).filter(InventoryItem.sku == sku).first()
-        if not inv:
-            raise HTTPException(status_code=400, detail=f"Producto no encontrado en inventario: {sku}")
-        if not bool(inv.active):
-            raise HTTPException(status_code=400, detail=f"Producto inactivo: {sku}")
-        if int(inv.stock or 0) < qty:
-            raise HTTPException(status_code=400, detail=f"Stock insuficiente para {sku}. Disponible: {int(inv.stock or 0)}")
-
 def _create_pending_order(db, checkout_data: dict):
     pickup_code, pickup_token = _ensure_unique_pickup_fields(db)
 
@@ -1052,6 +1022,63 @@ def admin_inventory_adjust_stock(payload: dict, request: Request):
         db.close()
 
 
+@app.post("/admin/inventory/sell")
+def admin_inventory_sell(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    payload = payload or {}
+    sku = _normalize_code(payload.get("sku"), upper=True)
+    barcode = _normalize_code(payload.get("barcode"), upper=True)
+
+    try:
+        qty = int(payload.get("qty", 1))
+    except Exception:
+        raise HTTPException(status_code=400, detail="qty must be integer")
+
+    if qty <= 0:
+        raise HTTPException(status_code=400, detail="qty must be >= 1")
+
+    db = SessionLocal()
+    try:
+        item = None
+        if sku:
+            item = db.query(InventoryItem).filter(InventoryItem.sku == sku).first()
+        elif barcode:
+            item = db.query(InventoryItem).filter(InventoryItem.barcode == barcode).first()
+        else:
+            raise HTTPException(status_code=400, detail="sku or barcode is required")
+
+        if not item:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+
+        if not bool(item.active):
+            raise HTTPException(status_code=400, detail="Inventory item inactive")
+
+        before_stock = int(item.stock or 0)
+        if before_stock < qty:
+            raise HTTPException(status_code=400, detail="Insufficient stock")
+
+        item.stock = before_stock - qty
+        item.updated_at = _now_utc()
+
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+
+        return {
+            "ok": True,
+            "message": "Sale recorded",
+            "qty": qty,
+            "before_stock": before_stock,
+            "after_stock": int(item.stock or 0),
+            "item": _inventory_to_dict(item),
+        }
+    finally:
+        db.close()
+
+
 # -------------------------
 # Admin endpoints (TEMP)
 # -------------------------
@@ -1340,7 +1367,6 @@ async def create_checkout(payload: dict):
 
     db = SessionLocal()
     try:
-        _assert_inventory_available_for_checkout(db, checkout_data["cleaned_items"])
         order, pickup_code, pickup_token = _create_pending_order(db, checkout_data)
 
         success_url = f"{os.getenv('BASE_URL', '').rstrip('/')}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}"
@@ -1405,7 +1431,6 @@ async def create_mobile_checkout(payload: dict):
 
     db = SessionLocal()
     try:
-        _assert_inventory_available_for_checkout(db, checkout_data["cleaned_items"])
         order, pickup_code, pickup_token = _create_pending_order(db, checkout_data)
 
         customer = stripe.Customer.create(
