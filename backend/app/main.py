@@ -193,6 +193,28 @@ def _normalize_gender(value: str):
     return value or None
 
 
+
+
+def _normalize_sizes_list(values):
+    if not isinstance(values, list) or len(values) == 0:
+        raise HTTPException(status_code=400, detail="sizes must be a non-empty list")
+
+    cleaned = []
+    seen = set()
+    for value in values:
+        size = _normalize_size(value)
+        if not size:
+            raise HTTPException(status_code=400, detail="sizes contains invalid value")
+        if size in seen:
+            continue
+        seen.add(size)
+        cleaned.append(size)
+
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="sizes must be a non-empty list")
+
+    return cleaned
+
 def _build_inventory_sku(school_code: str, product_type: str, size: str, gender: str = None) -> str:
     school_code = _normalize_code(school_code, upper=True)
     product_type = _normalize_code(product_type, upper=True)
@@ -757,6 +779,112 @@ def admin_update_inventory_item(item_id: int, payload: dict, request: Request):
     except Exception as e:
         db.rollback()
         logger.exception("admin_update_inventory_item failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+
+
+@app.post("/admin/inventory/bulk-create")
+def admin_bulk_create_inventory(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    payload = payload or {}
+
+    school_code = _normalize_code(payload.get("school_code"), upper=True)
+    product_type = _normalize_code(payload.get("product_type"), upper=True)
+    gender = _normalize_gender(payload.get("gender"))
+    sizes = _normalize_sizes_list(payload.get("sizes"))
+
+    if not school_code:
+        raise HTTPException(status_code=400, detail="school_code is required")
+    if not product_type:
+        raise HTTPException(status_code=400, detail="product_type is required")
+
+    try:
+        stock = int(payload.get("stock", 0))
+    except Exception:
+        raise HTTPException(status_code=400, detail="stock must be integer")
+    if stock < 0:
+        raise HTTPException(status_code=400, detail="stock must be >= 0")
+
+    try:
+        price_mxn = int(round(float(payload.get("price_mxn", payload.get("price", 0)))))
+    except Exception:
+        raise HTTPException(status_code=400, detail="price_mxn must be numeric")
+    if price_mxn < 0:
+        raise HTTPException(status_code=400, detail="price_mxn must be >= 0")
+
+    active = payload.get("active", True)
+    if isinstance(active, bool):
+        active_value = active
+    else:
+        active_text = str(active).strip().lower()
+        active_value = active_text in ("1", "true", "yes", "y", "on")
+
+    created_items = []
+    created_skus = set()
+
+    db = SessionLocal()
+    try:
+        existing_skus = {row[0] for row in db.query(InventoryItem.sku).all()}
+        existing_barcodes = {row[0] for row in db.query(InventoryItem.barcode).all()}
+
+        for size in sizes:
+            item = InventoryItem(
+                school_code="",
+                product_type="",
+                size="",
+                gender=None,
+                sku="",
+                barcode="",
+                stock=0,
+                price_mxn=0,
+                active=True,
+                created_at=_now_utc(),
+                updated_at=_now_utc(),
+            )
+            data = {
+                "school_code": school_code,
+                "product_type": product_type,
+                "size": size,
+                "gender": gender,
+                "stock": stock,
+                "price_mxn": price_mxn,
+                "active": active_value,
+            }
+            _apply_inventory_fields(item, data)
+
+            if item.sku in existing_skus or item.sku in created_skus:
+                raise HTTPException(status_code=400, detail=f"SKU already exists: {item.sku}")
+            if item.barcode in existing_barcodes:
+                raise HTTPException(status_code=400, detail=f"Barcode already exists: {item.barcode}")
+
+            created_skus.add(item.sku)
+            created_items.append(item)
+
+        for item in created_items:
+            db.add(item)
+
+        db.commit()
+
+        for item in created_items:
+            db.refresh(item)
+
+        return {
+            "ok": True,
+            "count": len(created_items),
+            "items": [_inventory_to_dict(item) for item in created_items],
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("admin_bulk_create_inventory failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
