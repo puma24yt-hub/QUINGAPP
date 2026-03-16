@@ -193,6 +193,44 @@ class PosSaleItem(Base):
     sale = relationship("PosSale", back_populates="items")
 
 
+class PartnerAccount(Base):
+    __tablename__ = "partner_accounts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    school_code = Column(String(20), nullable=False, unique=True)
+    school_name = Column(String(120), nullable=False, default="")
+    partner_name = Column(String(120), nullable=False, default="")
+    access_code = Column(String(80), nullable=False, unique=True)
+    commission_per_item = Column(Integer, nullable=False, default=40)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    history = relationship("PartnerCommissionHistory", back_populates="partner", cascade="all, delete-orphan")
+
+
+class PartnerCommissionHistory(Base):
+    __tablename__ = "partner_commission_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    partner_id = Column(Integer, ForeignKey("partner_accounts.id"), nullable=False)
+    school_code = Column(String(20), nullable=False)
+    items_sold = Column(Integer, nullable=False, default=0)
+    commission_total_mxn = Column(Integer, nullable=False, default=0)
+    paid_from_at = Column(DateTime(timezone=True), nullable=True)
+    paid_to_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    partner = relationship("PartnerAccount", back_populates="history")
+
+
+if engine:
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception:
+        logger.exception("runtime metadata sync failed for partner tables")
+
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -434,6 +472,196 @@ def _start_of_today_utc():
 def _start_of_month_utc():
     now = _now_utc()
     return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+
+
+def _partner_account_to_dict(partner: "PartnerAccount"):
+    return {
+        "id": partner.id,
+        "school_code": partner.school_code,
+        "school_name": partner.school_name,
+        "partner_name": partner.partner_name,
+        "access_code": partner.access_code,
+        "commission_per_item": int(partner.commission_per_item or 0),
+        "active": bool(partner.active),
+        "created_at": _dt(partner.created_at),
+        "updated_at": _dt(partner.updated_at),
+    }
+
+
+def _partner_history_to_dict(row: "PartnerCommissionHistory"):
+    return {
+        "id": row.id,
+        "partner_id": row.partner_id,
+        "school_code": row.school_code,
+        "items_sold": int(row.items_sold or 0),
+        "commission_total_mxn": int(row.commission_total_mxn or 0),
+        "paid_from_at": _dt(row.paid_from_at),
+        "paid_to_at": _dt(row.paid_to_at),
+        "created_at": _dt(row.created_at),
+    }
+
+
+def _extract_school_code_from_sku(sku: str) -> str:
+    sku = str(sku or "").strip().upper()
+    if not sku:
+        return ""
+    return sku.split("-", 1)[0].strip()
+
+
+def _partner_last_paid_to(db, partner: "PartnerAccount"):
+    row = (
+        db.query(PartnerCommissionHistory)
+        .filter(PartnerCommissionHistory.partner_id == int(partner.id))
+        .order_by(PartnerCommissionHistory.paid_to_at.desc(), PartnerCommissionHistory.id.desc())
+        .first()
+    )
+    return row.paid_to_at if row else None
+
+
+def _partner_collect_sales_rows(db, partner: "PartnerAccount"):
+    school_code = str(partner.school_code or "").strip().upper()
+    if not school_code:
+        return []
+
+    rows = []
+
+    paid_orders = db.query(Order).filter(Order.status == "PAID").all()
+    for order in paid_orders:
+        event_at = order.paid_at or order.created_at
+        for item in (order.items or []):
+            sku = str(getattr(item, "sku", "") or "").strip().upper()
+            if _extract_school_code_from_sku(sku) != school_code:
+                continue
+            rows.append({
+                "source": "ONLINE",
+                "event_at": event_at,
+                "order_id": order.id,
+                "folio": None,
+                "sku": sku,
+                "name": getattr(item, "name", "") or sku,
+                "qty": int(getattr(item, "qty", 0) or 0),
+            })
+
+    pos_sales = db.query(PosSale).order_by(PosSale.created_at.asc()).all()
+    for sale in pos_sales:
+        event_at = sale.created_at
+        for item in (sale.items or []):
+            sku = str(getattr(item, "sku", "") or "").strip().upper()
+            if _extract_school_code_from_sku(sku) != school_code:
+                continue
+            rows.append({
+                "source": "POS",
+                "event_at": event_at,
+                "order_id": None,
+                "folio": sale.folio,
+                "sku": sku,
+                "name": getattr(item, "name", "") or sku,
+                "qty": int(getattr(item, "qty", 0) or 0),
+            })
+
+    rows.sort(key=lambda x: (x["event_at"] or datetime(1970, 1, 1, tzinfo=timezone.utc), x["source"]))
+    return rows
+
+
+def _partner_build_dashboard(db, partner: "PartnerAccount"):
+    rows = _partner_collect_sales_rows(db, partner)
+    now = _now_utc()
+    start_today = _start_of_today_utc()
+    start_month = _start_of_month_utc()
+    last_paid_to = _partner_last_paid_to(db, partner)
+    commission = int(partner.commission_per_item or 0)
+
+    items_today = 0
+    items_month = 0
+    pending_items = 0
+    pending_rows = []
+    product_rows = {}
+    latest_pending_at = None
+
+    for row in rows:
+        qty = int(row["qty"] or 0)
+        event_at = row["event_at"]
+        if event_at and event_at >= start_today:
+            items_today += qty
+        if event_at and event_at >= start_month:
+            items_month += qty
+        is_pending = True
+        if last_paid_to and event_at:
+            is_pending = event_at > last_paid_to
+        elif last_paid_to and event_at is None:
+            is_pending = False
+
+        if is_pending:
+            pending_items += qty
+            pending_rows.append(row)
+            product_key = row["name"] or row["sku"]
+            bucket = product_rows.setdefault(product_key, {"name": product_key, "qty": 0})
+            bucket["qty"] += qty
+            if event_at and (latest_pending_at is None or event_at > latest_pending_at):
+                latest_pending_at = event_at
+
+    history_rows = (
+        db.query(PartnerCommissionHistory)
+        .filter(PartnerCommissionHistory.partner_id == int(partner.id))
+        .order_by(PartnerCommissionHistory.created_at.desc(), PartnerCommissionHistory.id.desc())
+        .limit(30)
+        .all()
+    )
+
+    pending_rows_out = []
+    for row in pending_rows[-50:][::-1]:
+        pending_rows_out.append({
+            "source": row["source"],
+            "event_at": _dt(row["event_at"]),
+            "order_id": row["order_id"],
+            "folio": row["folio"],
+            "sku": row["sku"],
+            "name": row["name"],
+            "qty": int(row["qty"] or 0),
+            "commission_mxn": int(row["qty"] or 0) * commission,
+        })
+
+    product_rows_out = sorted(
+        (
+            {
+                "name": value["name"],
+                "qty": int(value["qty"] or 0),
+                "commission_mxn": int(value["qty"] or 0) * commission,
+            }
+            for value in product_rows.values()
+        ),
+        key=lambda x: (-x["qty"], x["name"]),
+    )
+
+    return {
+        "partner": _partner_account_to_dict(partner),
+        "summary": {
+            "school_code": partner.school_code,
+            "school_name": partner.school_name,
+            "partner_name": partner.partner_name,
+            "commission_per_item": commission,
+            "items_today": items_today,
+            "items_month": items_month,
+            "pending_items": pending_items,
+            "pending_commission_mxn": pending_items * commission,
+            "last_paid_to_at": _dt(last_paid_to),
+            "latest_pending_at": _dt(latest_pending_at),
+        },
+        "pending_rows": pending_rows_out,
+        "product_rows": product_rows_out,
+        "history": [_partner_history_to_dict(row) for row in history_rows],
+    }
+
+
+def _partner_find_by_code(db, code: str):
+    code = _normalize_code(code, upper=True)
+    if not code:
+        return None
+    return (
+        db.query(PartnerAccount)
+        .filter(PartnerAccount.access_code == code, PartnerAccount.active == True)
+        .first()
+    )
 
 
 def _order_to_dict(o: Order):
@@ -1682,6 +1910,194 @@ def admin_get_order(order_id: int, request: Request):
         if not o:
             raise HTTPException(status_code=404, detail="Order not found")
         return {"ok": True, "order": _order_to_dict(o)}
+    finally:
+        db.close()
+
+
+# -------------------------
+# Partner / socios
+# -------------------------
+@app.get("/admin/partners")
+def admin_list_partners(request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    db = SessionLocal()
+    try:
+        partners = db.query(PartnerAccount).order_by(PartnerAccount.school_name.asc(), PartnerAccount.id.asc()).all()
+        rows = []
+        for partner in partners:
+            dashboard = _partner_build_dashboard(db, partner)
+            rows.append({
+                **_partner_account_to_dict(partner),
+                "pending_items": dashboard["summary"]["pending_items"],
+                "pending_commission_mxn": dashboard["summary"]["pending_commission_mxn"],
+                "items_today": dashboard["summary"]["items_today"],
+                "items_month": dashboard["summary"]["items_month"],
+                "last_paid_to_at": dashboard["summary"]["last_paid_to_at"],
+            })
+        return {"ok": True, "count": len(rows), "partners": rows}
+    finally:
+        db.close()
+
+
+@app.post("/admin/partners")
+def admin_create_partner(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    school_code = _normalize_code(payload.get("school_code"), upper=True)
+    school_name = str(payload.get("school_name", "")).strip()
+    partner_name = str(payload.get("partner_name", "")).strip()
+    access_code = _normalize_code(payload.get("access_code"), upper=True)
+    try:
+        commission_per_item = int(round(float(payload.get("commission_per_item", 40))))
+    except Exception:
+        raise HTTPException(status_code=400, detail="commission_per_item inválido")
+
+    if not school_code:
+        raise HTTPException(status_code=400, detail="school_code es requerido")
+    if not school_name:
+        raise HTTPException(status_code=400, detail="school_name es requerido")
+    if not partner_name:
+        raise HTTPException(status_code=400, detail="partner_name es requerido")
+    if not access_code:
+        raise HTTPException(status_code=400, detail="access_code es requerido")
+    if commission_per_item < 0:
+        raise HTTPException(status_code=400, detail="commission_per_item inválido")
+
+    db = SessionLocal()
+    try:
+        existing_school = db.query(PartnerAccount).filter(PartnerAccount.school_code == school_code).first()
+        if existing_school:
+            raise HTTPException(status_code=400, detail="Ya existe un socio para esa escuela")
+        existing_code = db.query(PartnerAccount).filter(PartnerAccount.access_code == access_code).first()
+        if existing_code:
+            raise HTTPException(status_code=400, detail="Ese código ya existe")
+
+        now = _now_utc()
+        partner = PartnerAccount(
+            school_code=school_code,
+            school_name=school_name,
+            partner_name=partner_name,
+            access_code=access_code,
+            commission_per_item=commission_per_item,
+            active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(partner)
+        db.commit()
+        db.refresh(partner)
+        return {"ok": True, "partner": _partner_account_to_dict(partner)}
+    finally:
+        db.close()
+
+
+@app.get("/admin/partner/dashboard")
+def admin_partner_dashboard(request: Request, school_code: str = ""):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    school_code = _normalize_code(school_code, upper=True)
+    if not school_code:
+        raise HTTPException(status_code=400, detail="school_code es requerido")
+
+    db = SessionLocal()
+    try:
+        partner = db.query(PartnerAccount).filter(PartnerAccount.school_code == school_code).first()
+        if not partner:
+            raise HTTPException(status_code=404, detail="Socio no encontrado")
+        return {"ok": True, **_partner_build_dashboard(db, partner)}
+    finally:
+        db.close()
+
+
+@app.post("/admin/partner/pay")
+def admin_partner_pay(payload: dict, request: Request):
+    _require_admin(request)
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    school_code = _normalize_code(payload.get("school_code"), upper=True)
+    if not school_code:
+        raise HTTPException(status_code=400, detail="school_code es requerido")
+
+    db = SessionLocal()
+    try:
+        partner = db.query(PartnerAccount).filter(PartnerAccount.school_code == school_code).first()
+        if not partner:
+            raise HTTPException(status_code=404, detail="Socio no encontrado")
+
+        dashboard = _partner_build_dashboard(db, partner)
+        pending_items = int(dashboard["summary"]["pending_items"] or 0)
+        pending_total = int(dashboard["summary"]["pending_commission_mxn"] or 0)
+        if pending_items <= 0 or pending_total <= 0:
+            raise HTTPException(status_code=400, detail="No hay comisión pendiente")
+
+        paid_from = None
+        if dashboard["summary"]["last_paid_to_at"]:
+            paid_from = datetime.fromisoformat(str(dashboard["summary"]["last_paid_to_at"]).replace("Z", "+00:00"))
+        paid_to = None
+        if dashboard["summary"]["latest_pending_at"]:
+            paid_to = datetime.fromisoformat(str(dashboard["summary"]["latest_pending_at"]).replace("Z", "+00:00"))
+
+        row = PartnerCommissionHistory(
+            partner_id=partner.id,
+            school_code=partner.school_code,
+            items_sold=pending_items,
+            commission_total_mxn=pending_total,
+            paid_from_at=paid_from,
+            paid_to_at=paid_to,
+            created_at=_now_utc(),
+        )
+        db.add(row)
+        partner.updated_at = _now_utc()
+        db.add(partner)
+        db.commit()
+        db.refresh(row)
+        return {"ok": True, "history": _partner_history_to_dict(row)}
+    finally:
+        db.close()
+
+
+@app.post("/partner/login")
+def partner_login(payload: dict):
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    code = _normalize_code(payload.get("code"), upper=True)
+    if not code:
+        raise HTTPException(status_code=400, detail="Código requerido")
+
+    db = SessionLocal()
+    try:
+        partner = _partner_find_by_code(db, code)
+        if not partner:
+            raise HTTPException(status_code=401, detail="Código inválido")
+        return {"ok": True, "partner": _partner_account_to_dict(partner)}
+    finally:
+        db.close()
+
+
+@app.get("/partner/dashboard")
+def partner_dashboard(code: str = ""):
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    code = _normalize_code(code, upper=True)
+    if not code:
+        raise HTTPException(status_code=400, detail="Código requerido")
+
+    db = SessionLocal()
+    try:
+        partner = _partner_find_by_code(db, code)
+        if not partner:
+            raise HTTPException(status_code=401, detail="Código inválido")
+        return {"ok": True, **_partner_build_dashboard(db, partner)}
     finally:
         db.close()
 
