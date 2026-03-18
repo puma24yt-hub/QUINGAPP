@@ -5,8 +5,40 @@ import stripe
 import uuid
 import secrets
 import os
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import re
+
+
+def _load_local_env():
+    """Minimal .env loader so local SMTP settings work without extra packages."""
+    candidates = [
+        Path(__file__).resolve().parent / '.env',
+        Path(__file__).resolve().parent.parent / '.env',
+        Path.cwd() / '.env',
+    ]
+    for env_path in candidates:
+        try:
+            if not env_path.exists():
+                continue
+            for raw_line in env_path.read_text(encoding='utf-8').splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+            return
+        except Exception:
+            continue
+
+
+_load_local_env()
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, DateTime, ForeignKey, text, Boolean
@@ -2316,10 +2348,16 @@ def _build_sales_note_text(order: Order) -> str:
 def _send_note_email_if_configured(order: Order):
     """Returns (ok: bool, err: str). Sends only if SMTP is configured."""
     host = os.getenv("SMTP_HOST", "").strip()
-    port = int(os.getenv("SMTP_PORT", "0") or "0")
+    port_raw = str(os.getenv("SMTP_PORT", "0") or "0").strip()
     user = os.getenv("SMTP_USER", "").strip()
     pwd = os.getenv("SMTP_PASS", "").strip()
-    from_email = os.getenv("SMTP_FROM", "").strip()
+    from_email = (os.getenv("SMTP_FROM", "").strip() or user)
+    from_name = (os.getenv("SMTP_FROM_NAME", "").strip() or "QUING")
+
+    try:
+        port = int(port_raw or "0")
+    except Exception:
+        return False, "SMTP_PORT invalid"
 
     if not host or not port or not from_email:
         return False, "SMTP not configured"
@@ -2327,10 +2365,11 @@ def _send_note_email_if_configured(order: Order):
     try:
         import smtplib
         from email.message import EmailMessage
+        from email.utils import formataddr
 
         msg = EmailMessage()
-        msg["Subject"] = f"Nota de venta QUING — Pedido #{order.id}"
-        msg["From"] = from_email
+        msg["Subject"] = f"Tu ticket de compra QUING — Pedido #{order.id}"
+        msg["From"] = formataddr((from_name, from_email))
         msg["To"] = order.customer_email
 
         if not order.customer_email:
