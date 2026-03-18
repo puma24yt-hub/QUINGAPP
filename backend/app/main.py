@@ -2377,14 +2377,19 @@ def _pdf_logo_candidates() -> list[Path]:
     here = Path(__file__).resolve().parent
     return [
         here / "assets" / "quing_logo.png",
+        here / "assets" / "logo quing textil sin fondo.png",
         here / "assets" / "LOGO QUING TEXTIL.png",
         here.parent / "assets" / "quing_logo.png",
+        here.parent / "assets" / "logo quing textil sin fondo.png",
         here.parent / "assets" / "LOGO QUING TEXTIL.png",
         Path.cwd() / "app" / "assets" / "quing_logo.png",
+        Path.cwd() / "app" / "assets" / "logo quing textil sin fondo.png",
         Path.cwd() / "app" / "assets" / "LOGO QUING TEXTIL.png",
         Path.cwd() / "backend" / "app" / "assets" / "quing_logo.png",
+        Path.cwd() / "backend" / "app" / "assets" / "logo quing textil sin fondo.png",
         Path.cwd() / "backend" / "app" / "assets" / "LOGO QUING TEXTIL.png",
         Path.cwd() / "assets" / "quing_logo.png",
+        Path.cwd() / "assets" / "logo quing textil sin fondo.png",
         Path.cwd() / "assets" / "LOGO QUING TEXTIL.png",
     ]
 
@@ -2436,43 +2441,44 @@ def _make_pickup_qr_image(order: Order):
 
 
 def _draw_pdf_header(pdf: canvas.Canvas, width: float, height: float, order: Order):
-    blue = colors.HexColor("#1D4ED8")
-    dark_blue = colors.HexColor("#1E3A8A")
-    white = colors.white
-    brand_x = 18 * mm
-    brand_y_top = height - 18 * mm
+    dark = colors.HexColor("#111827")
+    muted = colors.HexColor("#6B7280")
+    soft_gray = colors.HexColor("#E5E7EB")
     logo_path = _find_pdf_logo_path()
 
-    pdf.setFillColor(blue)
+    pdf.setFillColor(colors.white)
     pdf.rect(0, height - 42 * mm, width, 42 * mm, stroke=0, fill=1)
+    pdf.setStrokeColor(soft_gray)
+    pdf.line(18 * mm, height - 38 * mm, width - 18 * mm, height - 38 * mm)
 
-    pdf.setFillColor(white)
-    pdf.roundRect(14 * mm, height - 36 * mm, 42 * mm, 24 * mm, 3 * mm, stroke=0, fill=1)
-
+    logo_drawn = False
     if logo_path:
         try:
             logo = ImageReader(str(logo_path))
-            pdf.drawImage(logo, 16 * mm, height - 34 * mm, width=38 * mm, height=20 * mm, preserveAspectRatio=True, mask='auto')
+            pdf.drawImage(
+                logo,
+                18 * mm,
+                height - 33 * mm,
+                width=64 * mm,
+                height=22 * mm,
+                preserveAspectRatio=True,
+                mask='auto',
+            )
+            logo_drawn = True
         except Exception:
             logger.exception("PDF logo draw failed")
-            pdf.setFillColor(dark_blue)
-            pdf.setFont("Helvetica-Bold", 12)
-            pdf.drawString(20 * mm, height - 24 * mm, "QUING")
-    else:
-        pdf.setFillColor(dark_blue)
-        pdf.setFont("Helvetica-Bold", 12)
-        pdf.drawString(20 * mm, height - 24 * mm, "QUING")
 
-    pdf.setFillColor(white)
-    pdf.setFont("Helvetica-Bold", 20)
-    pdf.drawString(64 * mm, brand_y_top, "QUING TEXTIL")
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(64 * mm, brand_y_top - 7 * mm, "Ticket de compra")
+    if not logo_drawn:
+        pdf.setFillColor(dark)
+        pdf.setFont("Helvetica-Bold", 18)
+        pdf.drawString(18 * mm, height - 20 * mm, "QUING")
 
+    pdf.setFillColor(dark)
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawRightString(width - 18 * mm, brand_y_top, f"Pedido #{order.id}")
+    pdf.drawRightString(width - 18 * mm, height - 18 * mm, f"Pedido #{order.id}")
+    pdf.setFillColor(muted)
     pdf.setFont("Helvetica", 10)
-    pdf.drawRightString(width - 18 * mm, brand_y_top - 7 * mm, _fmt_local_dt(order.paid_at or order.created_at))
+    pdf.drawRightString(width - 18 * mm, height - 25 * mm, _fmt_local_dt(order.paid_at or order.created_at))
 
 
 def _draw_items_header(pdf: canvas.Canvas, left: float, right: float, y: float):
@@ -2540,7 +2546,7 @@ def _generate_sales_note_pdf_bytes(order: Order) -> bytes:
     pdf.drawCentredString(qr_x + 12 * mm, info_top - 32 * mm, "QR de entrega")
 
     y = info_top - info_height - 10 * mm
-    pdf.setFillColor(blue)
+    pdf.setFillColor(dark)
     pdf.setFont("Helvetica-Bold", 11)
     pdf.drawString(left, y, "Detalle de compra")
     y -= 8 * mm
