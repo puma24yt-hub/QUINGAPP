@@ -154,6 +154,10 @@ if DATABASE_URL:
     Base.metadata.create_all(bind=engine)
     try:
         with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_email VARCHAR(254) NOT NULL DEFAULT ''"))
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS note_sent_at TIMESTAMPTZ NULL"))
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS note_status VARCHAR(32) NOT NULL DEFAULT 'PENDING'"))
+            conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS note_error VARCHAR(500) NOT NULL DEFAULT ''"))
             conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS inventory_deducted_at TIMESTAMPTZ NULL"))
             conn.execute(text("ALTER TABLE order_items ADD COLUMN IF NOT EXISTS sku VARCHAR(80) NOT NULL DEFAULT ''"))
     except Exception:
@@ -2280,6 +2284,35 @@ def _mark_note_status(db, order: Order, status: str, err: str = ""):
     db.add(order)
 
 
+def _build_sales_note_text(order: Order) -> str:
+    lines = [
+        "Gracias por tu compra en QUING.",
+        f"Pedido: #{order.id}",
+        f"Nombre: {order.customer_name}",
+        f"Correo: {order.customer_email}",
+        f"Total: ${order.total_mxn} MXN",
+        "",
+        "Detalle:",
+    ]
+
+    for it in (order.items or []):
+        qty = int(getattr(it, "qty", 0) or 0)
+        unit_amount_mxn = int(getattr(it, "unit_amount_mxn", 0) or 0)
+        line_total = qty * unit_amount_mxn
+        lines.append(
+            f"- {it.name} | SKU: {getattr(it, 'sku', '') or '-'} | Cantidad: {qty} | Unitario: ${unit_amount_mxn} MXN | Subtotal: ${line_total} MXN"
+        )
+
+    lines += [
+        "",
+        f"Código de entrega: {order.pickup_code}",
+        f"Fecha límite para recoger: {_dt(order.expires_at)}" if order.expires_at else "",
+        "",
+        "Muestra tu QR y código de entrega en tienda.",
+    ]
+    return "\n".join([x for x in lines if x != ""])
+
+
 def _send_note_email_if_configured(order: Order):
     """Returns (ok: bool, err: str). Sends only if SMTP is configured."""
     host = os.getenv("SMTP_HOST", "").strip()
@@ -2300,24 +2333,10 @@ def _send_note_email_if_configured(order: Order):
         msg["From"] = from_email
         msg["To"] = order.customer_email
 
-        lines = [
-            "Gracias por tu compra en QUING.",
-            f"Pedido: #{order.id}",
-            f"Nombre: {order.customer_name}",
-            f"Total: ${order.total_mxn} MXN",
-            "",
-            "Detalle:",
-        ]
-        for it in (order.items or []):
-            lines.append(f"- {it.name} x{it.qty} — ${it.unit_amount_mxn} MXN")
-        lines += [
-            "",
-            f"Código de entrega: {order.pickup_code}",
-            f"Fecha límite para recoger: {_dt(order.expires_at)}" if order.expires_at else "",
-            "",
-            "Muestra tu QR y código de entrega en tienda.",
-        ]
-        msg.set_content("\n".join([x for x in lines if x != ""]))
+        if not order.customer_email:
+            return False, "Order has no customer_email"
+
+        msg.set_content(_build_sales_note_text(order))
 
         with smtplib.SMTP(host, port, timeout=20) as server:
             server.ehlo()
@@ -2335,6 +2354,24 @@ def _send_note_email_if_configured(order: Order):
         return True, ""
     except Exception as e:
         return False, str(e)
+
+
+def _send_note_email_for_order_if_needed(db, order: Order) -> bool:
+    if not order:
+        return False
+    if not str(getattr(order, "customer_email", "") or "").strip():
+        return False
+    if getattr(order, "status", "") != "PAID":
+        return False
+    if getattr(order, "note_status", "") not in ("PENDING", "FAILED"):
+        return False
+
+    ok, err = _send_note_email_if_configured(order)
+    if ok:
+        _mark_note_status(db, order, "SENT", "")
+    else:
+        _mark_note_status(db, order, "FAILED", err)
+    return ok
 
 
 # -------------------------
@@ -2508,13 +2545,8 @@ def checkout_success(session_id: str = ""):
             logger.exception("Success sync failed")
             return HTMLResponse(f"<h3>Payment sync failed</h3><pre>{e}</pre>", status_code=500)
 
-        # Send sales note once (if email configured and order has email)
-        if order.customer_email and order.note_status in ("PENDING", "FAILED"):
-            ok, err = _send_note_email_if_configured(order)
-            if ok:
-                _mark_note_status(db, order, "SENT", "")
-            else:
-                _mark_note_status(db, order, "FAILED", err)
+        # Send sales note once (if email configured and order is paid)
+        if _send_note_email_for_order_if_needed(db, order):
             db.commit()
             db.refresh(order)
 
@@ -2607,13 +2639,7 @@ async def stripe_webhook(request: Request):
             try:
                 order, payment = _mark_order_paid_from_session(db, session_id)
                 if order:
-                    if order.customer_email and order.note_status in ("PENDING", "FAILED"):
-                        ok, err = _send_note_email_if_configured(order)
-                        if ok:
-                            _mark_note_status(db, order, "SENT", "")
-                        else:
-                            _mark_note_status(db, order, "FAILED", err)
-
+                    _send_note_email_for_order_if_needed(db, order)
                     db.commit()
                 else:
                     db.rollback()
@@ -2632,12 +2658,7 @@ async def stripe_webhook(request: Request):
             try:
                 order, payment = _mark_order_paid_from_payment_intent(db, payment_intent_id)
                 if order:
-                    if order.customer_email and order.note_status in ("PENDING", "FAILED"):
-                        ok, err = _send_note_email_if_configured(order)
-                        if ok:
-                            _mark_note_status(db, order, "SENT", "")
-                        else:
-                            _mark_note_status(db, order, "FAILED", err)
+                    _send_note_email_for_order_if_needed(db, order)
                     db.commit()
                 else:
                     db.rollback()
