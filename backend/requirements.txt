@@ -4,3 +4,4 @@ python-dotenv
 stripe
 sqlalchemy
 psycopg2-binary
+reportlab

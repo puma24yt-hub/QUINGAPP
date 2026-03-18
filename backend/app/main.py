@@ -7,6 +7,7 @@ import secrets
 import os
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
 import re
 
 
@@ -48,6 +49,12 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from app.core.config import (
     STRIPE_WEBHOOK_SECRET, STRIPE_SECRET_KEY, DATABASE_URL
 )
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 
 app = FastAPI(title="QUINGAPP API")
 
@@ -2318,7 +2325,7 @@ def _mark_note_status(db, order: Order, status: str, err: str = ""):
 
 def _build_sales_note_text(order: Order) -> str:
     lines = [
-        "Gracias por tu compra en QUING.",
+        "Gracias por tu compra en Quing Textil.",
         f"Pedido: #{order.id}",
         f"Nombre: {order.customer_name}",
         f"Correo: {order.customer_email}",
@@ -2345,6 +2352,178 @@ def _build_sales_note_text(order: Order) -> str:
     return "\n".join([x for x in lines if x != ""])
 
 
+def _money_mxn(value: int) -> str:
+    try:
+        return f"${int(value or 0):,} MXN"
+    except Exception:
+        return f"${value} MXN"
+
+
+def _fmt_local_dt(value) -> str:
+    if not value:
+        return "-"
+    try:
+        dt = value
+        if getattr(dt, "tzinfo", None) is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(timezone(timedelta(hours=-6)))
+        return local_dt.strftime("%d/%m/%Y %I:%M %p")
+    except Exception:
+        return str(value)
+
+
+def _pdf_logo_candidates() -> list[Path]:
+    here = Path(__file__).resolve().parent
+    return [
+        here / "assets" / "quing_logo.png",
+        here / "assets" / "LOGO QUING TEXTIL.png",
+        here.parent / "assets" / "quing_logo.png",
+        here.parent / "assets" / "LOGO QUING TEXTIL.png",
+        Path.cwd() / "app" / "assets" / "quing_logo.png",
+        Path.cwd() / "app" / "assets" / "LOGO QUING TEXTIL.png",
+        Path.cwd() / "assets" / "quing_logo.png",
+        Path.cwd() / "assets" / "LOGO QUING TEXTIL.png",
+    ]
+
+
+def _find_pdf_logo_path() -> Path | None:
+    for path in _pdf_logo_candidates():
+        try:
+            if path.exists() and path.is_file():
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def _draw_pdf_header(pdf: canvas.Canvas, width: float, height: float, order: Order):
+    brand_x = 18 * mm
+    brand_y_top = height - 20 * mm
+    logo_path = _find_pdf_logo_path()
+
+    if logo_path:
+        try:
+            logo = ImageReader(str(logo_path))
+            pdf.drawImage(logo, brand_x, height - 48 * mm, width=40 * mm, height=24 * mm, preserveAspectRatio=True, mask='auto')
+        except Exception:
+            logger.exception("PDF logo draw failed")
+
+    pdf.setFont("Helvetica-Bold", 20)
+    pdf.setFillColor(colors.black)
+    pdf.drawString(64 * mm, brand_y_top, "QUING TEXTIL")
+
+    pdf.setFont("Helvetica", 10)
+    pdf.setFillColor(colors.HexColor("#444444"))
+    pdf.drawString(64 * mm, brand_y_top - 7 * mm, "Ticket de compra")
+    pdf.drawRightString(width - 18 * mm, brand_y_top, f"Pedido #{order.id}")
+    pdf.drawRightString(width - 18 * mm, brand_y_top - 7 * mm, _fmt_local_dt(order.paid_at or order.created_at))
+
+    pdf.setStrokeColor(colors.HexColor("#D9D9D9"))
+    pdf.setLineWidth(1)
+    pdf.line(18 * mm, height - 52 * mm, width - 18 * mm, height - 52 * mm)
+
+
+def _generate_sales_note_pdf_bytes(order: Order) -> bytes:
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    _draw_pdf_header(pdf, width, height, order)
+
+    left = 18 * mm
+    right = width - 18 * mm
+    y = height - 66 * mm
+
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.setFillColor(colors.black)
+    pdf.drawString(left, y, "Datos del cliente")
+    y -= 7 * mm
+
+    pdf.setFont("Helvetica", 10)
+    details = [
+        f"Nombre: {order.customer_name or '-'}",
+        f"Correo: {order.customer_email or '-'}",
+        f"Código de entrega: {order.pickup_code or '-'}",
+        f"Vence: {_fmt_local_dt(order.expires_at) if order.expires_at else '-'}",
+    ]
+    for line in details:
+        pdf.drawString(left, y, line)
+        y -= 5.5 * mm
+
+    y -= 2 * mm
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(left, y, "Detalle de compra")
+    y -= 8 * mm
+
+    col_name = left
+    col_sku = 105 * mm
+    col_qty = 145 * mm
+    col_unit = 162 * mm
+    col_total = right
+
+    pdf.setFillColor(colors.white)
+    pdf.setStrokeColor(colors.HexColor("#1F2937"))
+    pdf.setLineWidth(0.7)
+    pdf.rect(left, y - 4 * mm, right - left, 8 * mm, stroke=1, fill=1)
+    pdf.setFillColor(colors.black)
+    pdf.setFont("Helvetica-Bold", 9)
+    pdf.drawString(col_name + 2 * mm, y - 1 * mm, "Producto")
+    pdf.drawString(col_sku, y - 1 * mm, "SKU")
+    pdf.drawString(col_qty, y - 1 * mm, "Cant.")
+    pdf.drawString(col_unit, y - 1 * mm, "Unit.")
+    pdf.drawRightString(col_total - 2 * mm, y - 1 * mm, "Subtotal")
+    y -= 10 * mm
+
+    pdf.setFont("Helvetica", 9)
+    row_height = 7 * mm
+    items = list(order.items or [])
+    for idx, it in enumerate(items, start=1):
+        qty = int(getattr(it, "qty", 0) or 0)
+        unit_amount_mxn = int(getattr(it, "unit_amount_mxn", 0) or 0)
+        line_total = qty * unit_amount_mxn
+
+        if y < 38 * mm:
+            pdf.showPage()
+            width, height = A4
+            _draw_pdf_header(pdf, width, height, order)
+            y = height - 66 * mm
+            pdf.setFont("Helvetica", 9)
+
+        if idx % 2 == 0:
+            pdf.setFillColor(colors.HexColor("#F7F7F7"))
+            pdf.rect(left, y - 4.5 * mm, right - left, row_height, stroke=0, fill=1)
+        pdf.setFillColor(colors.black)
+
+        product_name = str(getattr(it, "name", "") or "-")[:34]
+        sku = str(getattr(it, "sku", "") or "-")[:18]
+        pdf.drawString(col_name + 2 * mm, y - 1 * mm, product_name)
+        pdf.drawString(col_sku, y - 1 * mm, sku)
+        pdf.drawString(col_qty, y - 1 * mm, str(qty))
+        pdf.drawString(col_unit, y - 1 * mm, _money_mxn(unit_amount_mxn).replace(" MXN", ""))
+        pdf.drawRightString(col_total - 2 * mm, y - 1 * mm, _money_mxn(line_total).replace(" MXN", ""))
+        y -= row_height
+
+    y -= 2 * mm
+    pdf.setStrokeColor(colors.HexColor("#D9D9D9"))
+    pdf.line(left, y, right, y)
+    y -= 8 * mm
+
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawRightString(right, y, f"Total: {_money_mxn(order.total_mxn)}")
+    y -= 10 * mm
+
+    pdf.setFont("Helvetica", 10)
+    pdf.setFillColor(colors.HexColor("#333333"))
+    pdf.drawString(left, y, "Gracias por tu compra en Quing Textil.")
+    y -= 5.5 * mm
+    pdf.drawString(left, y, "Presenta tu QR y código de entrega en tienda para recoger tu pedido.")
+
+    pdf.showPage()
+    pdf.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def _send_note_email_if_configured(order: Order):
     """Returns (ok: bool, err: str). Sends only if SMTP is configured."""
     host = os.getenv("SMTP_HOST", "").strip()
@@ -2352,7 +2531,7 @@ def _send_note_email_if_configured(order: Order):
     user = os.getenv("SMTP_USER", "").strip()
     pwd = os.getenv("SMTP_PASS", "").strip()
     from_email = (os.getenv("SMTP_FROM", "").strip() or user)
-    from_name = (os.getenv("SMTP_FROM_NAME", "").strip() or "QUING")
+    from_name = (os.getenv("SMTP_FROM_NAME", "").strip() or "QUING TEXTIL")
 
     try:
         port = int(port_raw or "0")
@@ -2368,14 +2547,22 @@ def _send_note_email_if_configured(order: Order):
         from email.utils import formataddr
 
         msg = EmailMessage()
-        msg["Subject"] = f"Tu ticket de compra QUING — Pedido #{order.id}"
+        msg["Subject"] = f"Tu compra en Quing Textil — Pedido #{order.id}"
         msg["From"] = formataddr((from_name, from_email))
         msg["To"] = order.customer_email
 
         if not order.customer_email:
             return False, "Order has no customer_email"
 
-        msg.set_content(_build_sales_note_text(order))
+        msg.set_content(
+            "Gracias por tu compra en Quing Textil.\n\n"
+            f"Adjuntamos tu ticket en PDF del pedido #{order.id}.\n"
+            "Muestra tu QR y código de entrega en tienda para recoger tu pedido."
+        )
+
+        pdf_bytes = _generate_sales_note_pdf_bytes(order)
+        filename = f"quing-textil-pedido-{order.id}.pdf"
+        msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
 
         with smtplib.SMTP(host, port, timeout=20) as server:
             server.ehlo()
@@ -2413,6 +2600,8 @@ def _send_note_email_for_order_if_needed(db, order: Order) -> bool:
     return ok
 
 
+# -------------------------
+# Checkout
 # -------------------------
 # Checkout
 # -------------------------
