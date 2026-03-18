@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 import re
+import qrcode
 
 
 def _load_local_env():
@@ -2381,6 +2382,8 @@ def _pdf_logo_candidates() -> list[Path]:
         here.parent / "assets" / "LOGO QUING TEXTIL.png",
         Path.cwd() / "app" / "assets" / "quing_logo.png",
         Path.cwd() / "app" / "assets" / "LOGO QUING TEXTIL.png",
+        Path.cwd() / "backend" / "app" / "assets" / "quing_logo.png",
+        Path.cwd() / "backend" / "app" / "assets" / "LOGO QUING TEXTIL.png",
         Path.cwd() / "assets" / "quing_logo.png",
         Path.cwd() / "assets" / "LOGO QUING TEXTIL.png",
     ]
@@ -2390,40 +2393,106 @@ def _find_pdf_logo_path() -> Path | None:
     for path in _pdf_logo_candidates():
         try:
             if path.exists() and path.is_file():
+                logger.info("PDF logo found at %s", path)
                 return path
         except Exception:
             continue
+    logger.warning("PDF logo not found in expected paths")
     return None
 
 
+def _wrap_pdf_text(pdf: canvas.Canvas, text_value: str, max_width: float, font_name: str = "Helvetica", font_size: int = 9) -> list[str]:
+    text_value = str(text_value or "-").strip() or "-"
+    words = text_value.split()
+    if not words:
+        return ["-"]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        trial = f"{current} {word}"
+        if pdf.stringWidth(trial, font_name, font_size) <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _make_pickup_qr_image(order: Order):
+    try:
+        payload = _pickup_qr_payload(order.pickup_token)
+        qr = qrcode.QRCode(version=None, box_size=8, border=2)
+        qr.add_data(payload)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        bio = BytesIO()
+        img.save(bio, format="PNG")
+        bio.seek(0)
+        return ImageReader(bio)
+    except Exception:
+        logger.exception("PDF QR generation failed")
+        return None
+
+
 def _draw_pdf_header(pdf: canvas.Canvas, width: float, height: float, order: Order):
+    blue = colors.HexColor("#1D4ED8")
+    dark_blue = colors.HexColor("#1E3A8A")
+    white = colors.white
     brand_x = 18 * mm
-    brand_y_top = height - 20 * mm
+    brand_y_top = height - 18 * mm
     logo_path = _find_pdf_logo_path()
+
+    pdf.setFillColor(blue)
+    pdf.rect(0, height - 42 * mm, width, 42 * mm, stroke=0, fill=1)
+
+    pdf.setFillColor(white)
+    pdf.roundRect(14 * mm, height - 36 * mm, 42 * mm, 24 * mm, 3 * mm, stroke=0, fill=1)
 
     if logo_path:
         try:
             logo = ImageReader(str(logo_path))
-            pdf.drawImage(logo, brand_x, height - 48 * mm, width=40 * mm, height=24 * mm, preserveAspectRatio=True, mask='auto')
+            pdf.drawImage(logo, 16 * mm, height - 34 * mm, width=38 * mm, height=20 * mm, preserveAspectRatio=True, mask='auto')
         except Exception:
             logger.exception("PDF logo draw failed")
+            pdf.setFillColor(dark_blue)
+            pdf.setFont("Helvetica-Bold", 12)
+            pdf.drawString(20 * mm, height - 24 * mm, "QUING")
+    else:
+        pdf.setFillColor(dark_blue)
+        pdf.setFont("Helvetica-Bold", 12)
+        pdf.drawString(20 * mm, height - 24 * mm, "QUING")
 
+    pdf.setFillColor(white)
     pdf.setFont("Helvetica-Bold", 20)
-    pdf.setFillColor(colors.black)
     pdf.drawString(64 * mm, brand_y_top, "QUING TEXTIL")
-
     pdf.setFont("Helvetica", 10)
-    pdf.setFillColor(colors.HexColor("#444444"))
     pdf.drawString(64 * mm, brand_y_top - 7 * mm, "Ticket de compra")
+
+    pdf.setFont("Helvetica-Bold", 11)
     pdf.drawRightString(width - 18 * mm, brand_y_top, f"Pedido #{order.id}")
+    pdf.setFont("Helvetica", 10)
     pdf.drawRightString(width - 18 * mm, brand_y_top - 7 * mm, _fmt_local_dt(order.paid_at or order.created_at))
 
-    pdf.setStrokeColor(colors.HexColor("#D9D9D9"))
-    pdf.setLineWidth(1)
-    pdf.line(18 * mm, height - 52 * mm, width - 18 * mm, height - 52 * mm)
+
+def _draw_items_header(pdf: canvas.Canvas, left: float, right: float, y: float):
+    blue = colors.HexColor("#1D4ED8")
+    pdf.setFillColor(blue)
+    pdf.setStrokeColor(blue)
+    pdf.roundRect(left, y - 4 * mm, right - left, 8 * mm, 1.5 * mm, stroke=0, fill=1)
+    pdf.setFillColor(colors.white)
+    pdf.setFont("Helvetica-Bold", 9)
+    pdf.drawString(left + 2 * mm, y - 1 * mm, "Producto")
+    pdf.drawString(116 * mm, y - 1 * mm, "Cant.")
+    pdf.drawString(132 * mm, y - 1 * mm, "Unit.")
+    pdf.drawRightString(right - 2 * mm, y - 1 * mm, "Subtotal")
 
 
 def _generate_sales_note_pdf_bytes(order: Order) -> bytes:
+    blue = colors.HexColor("#1D4ED8")
+    light_blue = colors.HexColor("#EFF6FF")
+    soft_gray = colors.HexColor("#E5E7EB")
+    dark = colors.HexColor("#111827")
     buffer = BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
@@ -2432,13 +2501,22 @@ def _generate_sales_note_pdf_bytes(order: Order) -> bytes:
 
     left = 18 * mm
     right = width - 18 * mm
-    y = height - 66 * mm
+    y = height - 58 * mm
 
+    info_top = y
+    info_height = 34 * mm
+    qr_size = 28 * mm
+    qr_x = right - qr_size
+
+    pdf.setFillColor(light_blue)
+    pdf.setStrokeColor(soft_gray)
+    pdf.roundRect(left, info_top - info_height, (qr_x - 6 * mm) - left, info_height, 2 * mm, stroke=1, fill=1)
+
+    pdf.setFillColor(blue)
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.setFillColor(colors.black)
-    pdf.drawString(left, y, "Datos del cliente")
-    y -= 7 * mm
+    pdf.drawString(left + 3 * mm, info_top - 6 * mm, "Datos del cliente")
 
+    pdf.setFillColor(dark)
     pdf.setFont("Helvetica", 10)
     details = [
         f"Nombre: {order.customer_name or '-'}",
@@ -2446,79 +2524,93 @@ def _generate_sales_note_pdf_bytes(order: Order) -> bytes:
         f"Código de entrega: {order.pickup_code or '-'}",
         f"Vence: {_fmt_local_dt(order.expires_at) if order.expires_at else '-'}",
     ]
+    detail_y = info_top - 13 * mm
     for line in details:
-        pdf.drawString(left, y, line)
-        y -= 5.5 * mm
+        pdf.drawString(left + 3 * mm, detail_y, line)
+        detail_y -= 5.2 * mm
 
-    y -= 2 * mm
+    qr_img = _make_pickup_qr_image(order)
+    pdf.setFillColor(colors.white)
+    pdf.setStrokeColor(soft_gray)
+    pdf.roundRect(qr_x - 4 * mm, info_top - info_height, qr_size + 4 * mm, info_height, 2 * mm, stroke=1, fill=1)
+    if qr_img:
+        pdf.drawImage(qr_img, qr_x - 2 * mm, info_top - 30 * mm, width=qr_size, height=qr_size, preserveAspectRatio=True, mask='auto')
+    pdf.setFillColor(blue)
+    pdf.setFont("Helvetica-Bold", 8)
+    pdf.drawCentredString(qr_x + 12 * mm, info_top - 32 * mm, "QR de entrega")
+
+    y = info_top - info_height - 10 * mm
+    pdf.setFillColor(blue)
     pdf.setFont("Helvetica-Bold", 11)
     pdf.drawString(left, y, "Detalle de compra")
     y -= 8 * mm
 
-    col_name = left
-    col_sku = 105 * mm
-    col_qty = 145 * mm
-    col_unit = 162 * mm
-    col_total = right
-
-    pdf.setFillColor(colors.white)
-    pdf.setStrokeColor(colors.HexColor("#1F2937"))
-    pdf.setLineWidth(0.7)
-    pdf.rect(left, y - 4 * mm, right - left, 8 * mm, stroke=1, fill=1)
-    pdf.setFillColor(colors.black)
-    pdf.setFont("Helvetica-Bold", 9)
-    pdf.drawString(col_name + 2 * mm, y - 1 * mm, "Producto")
-    pdf.drawString(col_sku, y - 1 * mm, "SKU")
-    pdf.drawString(col_qty, y - 1 * mm, "Cant.")
-    pdf.drawString(col_unit, y - 1 * mm, "Unit.")
-    pdf.drawRightString(col_total - 2 * mm, y - 1 * mm, "Subtotal")
+    col_name = left + 2 * mm
+    col_qty = 116 * mm
+    col_unit = 132 * mm
+    col_total = right - 2 * mm
+    product_width = col_qty - col_name - 6 * mm
+    _draw_items_header(pdf, left, right, y)
     y -= 10 * mm
 
-    pdf.setFont("Helvetica", 9)
-    row_height = 7 * mm
     items = list(order.items or [])
     for idx, it in enumerate(items, start=1):
         qty = int(getattr(it, "qty", 0) or 0)
         unit_amount_mxn = int(getattr(it, "unit_amount_mxn", 0) or 0)
         line_total = qty * unit_amount_mxn
+        product_name = str(getattr(it, "name", "") or "-")
+        wrapped = _wrap_pdf_text(pdf, product_name, product_width, "Helvetica", 9)
+        max_lines = 3
+        if len(wrapped) > max_lines:
+            wrapped = wrapped[:max_lines]
+            wrapped[-1] = wrapped[-1][:max(0, len(wrapped[-1]) - 3)] + "..."
+        row_height = max(9 * mm, (len(wrapped) * 4.8 + 3) * mm)
 
-        if y < 38 * mm:
+        if y - row_height < 28 * mm:
             pdf.showPage()
             width, height = A4
             _draw_pdf_header(pdf, width, height, order)
-            y = height - 66 * mm
-            pdf.setFont("Helvetica", 9)
+            y = height - 30 * mm
+            _draw_items_header(pdf, left, right, y)
+            y -= 10 * mm
 
-        if idx % 2 == 0:
-            pdf.setFillColor(colors.HexColor("#F7F7F7"))
-            pdf.rect(left, y - 4.5 * mm, right - left, row_height, stroke=0, fill=1)
-        pdf.setFillColor(colors.black)
+        if idx % 2 == 1:
+            pdf.setFillColor(colors.white)
+        else:
+            pdf.setFillColor(colors.HexColor("#F8FAFC"))
+        pdf.setStrokeColor(soft_gray)
+        pdf.roundRect(left, y - row_height + 2 * mm, right - left, row_height, 1.5 * mm, stroke=1, fill=1)
 
-        product_name = str(getattr(it, "name", "") or "-")[:34]
-        sku = str(getattr(it, "sku", "") or "-")[:18]
-        pdf.drawString(col_name + 2 * mm, y - 1 * mm, product_name)
-        pdf.drawString(col_sku, y - 1 * mm, sku)
-        pdf.drawString(col_qty, y - 1 * mm, str(qty))
-        pdf.drawString(col_unit, y - 1 * mm, _money_mxn(unit_amount_mxn).replace(" MXN", ""))
-        pdf.drawRightString(col_total - 2 * mm, y - 1 * mm, _money_mxn(line_total).replace(" MXN", ""))
-        y -= row_height
+        text_y = y - 4 * mm
+        pdf.setFillColor(dark)
+        pdf.setFont("Helvetica", 9)
+        for line in wrapped:
+            pdf.drawString(col_name, text_y, line)
+            text_y -= 4.8 * mm
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawString(col_qty, y - 4 * mm, str(qty))
+        pdf.drawString(col_unit, y - 4 * mm, _money_mxn(unit_amount_mxn).replace(" MXN", ""))
+        pdf.drawRightString(col_total, y - 4 * mm, _money_mxn(line_total).replace(" MXN", ""))
+        y -= row_height + 2 * mm
 
     y -= 2 * mm
-    pdf.setStrokeColor(colors.HexColor("#D9D9D9"))
-    pdf.line(left, y, right, y)
-    y -= 8 * mm
-
+    pdf.setFillColor(blue)
+    pdf.roundRect(right - 60 * mm, y - 9 * mm, 60 * mm, 11 * mm, 2 * mm, stroke=0, fill=1)
+    pdf.setFillColor(colors.white)
     pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawRightString(right, y, f"Total: {_money_mxn(order.total_mxn)}")
-    y -= 10 * mm
+    pdf.drawRightString(right - 3 * mm, y - 2 * mm, f"Total: {_money_mxn(order.total_mxn)}")
+    y -= 16 * mm
 
+    pdf.setFillColor(dark)
     pdf.setFont("Helvetica", 10)
-    pdf.setFillColor(colors.HexColor("#333333"))
     pdf.drawString(left, y, "Gracias por tu compra en Quing Textil.")
     y -= 5.5 * mm
     pdf.drawString(left, y, "Presenta tu QR y código de entrega en tienda para recoger tu pedido.")
+    y -= 8 * mm
+    pdf.setFillColor(colors.HexColor("#6B7280"))
+    pdf.setFont("Helvetica", 8)
+    pdf.drawString(left, y, f"Pedido #{order.id} · Generado {_fmt_local_dt(order.paid_at or order.created_at)}")
 
-    pdf.showPage()
     pdf.save()
     buffer.seek(0)
     return buffer.getvalue()

@@ -5,3 +5,4 @@ stripe
 sqlalchemy
 psycopg2-binary
 reportlab
+qrcode[pil]
