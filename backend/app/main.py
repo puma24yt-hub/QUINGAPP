@@ -2447,9 +2447,9 @@ def _draw_pdf_header(pdf: canvas.Canvas, width: float, height: float, order: Ord
     logo_path = _find_pdf_logo_path()
 
     pdf.setFillColor(colors.white)
-    pdf.rect(0, height - 42 * mm, width, 42 * mm, stroke=0, fill=1)
+    pdf.rect(0, height - 38 * mm, width, 38 * mm, stroke=0, fill=1)
     pdf.setStrokeColor(soft_gray)
-    pdf.line(18 * mm, height - 38 * mm, width - 18 * mm, height - 38 * mm)
+    pdf.line(18 * mm, height - 34 * mm, width - 18 * mm, height - 34 * mm)
 
     logo_drawn = False
     if logo_path:
@@ -2458,9 +2458,9 @@ def _draw_pdf_header(pdf: canvas.Canvas, width: float, height: float, order: Ord
             pdf.drawImage(
                 logo,
                 18 * mm,
-                height - 33 * mm,
-                width=64 * mm,
-                height=22 * mm,
+                height - 30 * mm,
+                width=82 * mm,
+                height=28 * mm,
                 preserveAspectRatio=True,
                 mask='auto',
             )
@@ -2475,10 +2475,10 @@ def _draw_pdf_header(pdf: canvas.Canvas, width: float, height: float, order: Ord
 
     pdf.setFillColor(dark)
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawRightString(width - 18 * mm, height - 18 * mm, f"Pedido #{order.id}")
+    pdf.drawRightString(width - 18 * mm, height - 16 * mm, f"Pedido #{order.id}")
     pdf.setFillColor(muted)
     pdf.setFont("Helvetica", 10)
-    pdf.drawRightString(width - 18 * mm, height - 25 * mm, _fmt_local_dt(order.paid_at or order.created_at))
+    pdf.drawRightString(width - 18 * mm, height - 22 * mm, _fmt_local_dt(order.paid_at or order.created_at))
 
 
 def _draw_items_header(pdf: canvas.Canvas, left: float, right: float, y: float):
@@ -2507,7 +2507,7 @@ def _generate_sales_note_pdf_bytes(order: Order) -> bytes:
 
     left = 18 * mm
     right = width - 18 * mm
-    y = height - 58 * mm
+    y = height - 52 * mm
 
     info_top = y
     info_height = 34 * mm
@@ -2601,10 +2601,10 @@ def _generate_sales_note_pdf_bytes(order: Order) -> bytes:
 
     y -= 2 * mm
     pdf.setFillColor(blue)
-    pdf.roundRect(right - 60 * mm, y - 9 * mm, 60 * mm, 11 * mm, 2 * mm, stroke=0, fill=1)
+    pdf.roundRect(right - 48 * mm, y - 7 * mm, 48 * mm, 8.5 * mm, 1.8 * mm, stroke=0, fill=1)
     pdf.setFillColor(colors.white)
-    pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawRightString(right - 3 * mm, y - 2 * mm, f"Total: {_money_mxn(order.total_mxn)}")
+    pdf.setFont("Helvetica-Bold", 10.5)
+    pdf.drawRightString(right - 2.5 * mm, y - 1.3 * mm, f"Total: {_money_mxn(order.total_mxn)}")
     y -= 16 * mm
 
     pdf.setFillColor(dark)
