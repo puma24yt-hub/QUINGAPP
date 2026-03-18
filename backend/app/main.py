@@ -2599,13 +2599,20 @@ def _generate_sales_note_pdf_bytes(order: Order) -> bytes:
         pdf.drawRightString(col_total, y - 4 * mm, _money_mxn(line_total).replace(" MXN", ""))
         y -= row_height + 2 * mm
 
-    y -= 2 * mm
-    pdf.setFillColor(blue)
-    pdf.roundRect(right - 48 * mm, y - 7 * mm, 48 * mm, 8.5 * mm, 1.8 * mm, stroke=0, fill=1)
-    pdf.setFillColor(colors.white)
-    pdf.setFont("Helvetica-Bold", 10.5)
-    pdf.drawRightString(right - 2.5 * mm, y - 1.3 * mm, f"Total: {_money_mxn(order.total_mxn)}")
-    y -= 16 * mm
+    y -= 1.5 * mm
+    pdf.setStrokeColor(colors.HexColor("#D1D5DB"))
+    pdf.setLineWidth(0.8)
+    pdf.line(left, y, right, y)
+
+    y -= 7 * mm
+    pdf.setFillColor(colors.HexColor("#374151"))
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.drawString(right - 50 * mm, y, "Total")
+
+    pdf.setFillColor(dark)
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawRightString(right, y, _money_mxn(order.total_mxn))
+    y -= 12 * mm
 
     pdf.setFillColor(dark)
     pdf.setFont("Helvetica", 10)
