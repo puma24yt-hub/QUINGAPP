@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import logging
 import stripe
@@ -58,6 +59,25 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 app = FastAPI(title="QUINGAPP API")
+
+# CORS for Flutter Web / Chrome POS testing
+CORS_ALLOW_ORIGINS_RAW = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+if CORS_ALLOW_ORIGINS_RAW == "*":
+    _cors_allow_origins = ["*"]
+else:
+    _cors_allow_origins = [
+        origin.strip()
+        for origin in CORS_ALLOW_ORIGINS_RAW.split(",")
+        if origin.strip()
+    ] or ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allow_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 logger = logging.getLogger("quingapp")
 if not logger.handlers:
